@@ -1,0 +1,1548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Geo-Assist</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #f8fafd;
+  --surface: #ffffff;
+  --sidebar-bg: #080c18;
+  --sidebar-text: #b0bfd4;
+  --sidebar-muted: #48607e;
+  --accent: #0ea5e9;
+  --accent-hover: #0284c7;
+  --border: #dde4ef;
+  --text: #0f172a;
+  --text-muted: #64748b;
+  --bubble-user: #0ea5e9;
+  --bubble-assistant: #ffffff;
+  --danger: #ef4444;
+  --ok: #10b981;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b1120;
+    --surface: #0e1a2e;
+    --border: #1a2b42;
+    --text: #dce6f5;
+    --text-muted: #5e7a9a;
+    --bubble-assistant: #111d30;
+  }
+}
+
+html, body { height: 100%; overflow: hidden; background: var(--bg); }
+
+#app { display: flex; height: 100vh; }
+
+/* ── sidebar ── */
+#sidebar {
+  width: 240px;
+  min-width: 240px;
+  height: 100vh;
+  background: linear-gradient(180deg, #0c1424 0%, #070b14 100%);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-right: 1px solid rgba(14,165,233,.1);
+}
+
+.logo {
+  padding: 16px 16px 13px;
+  font-size: 15px;
+  font-weight: 700;
+  color: #e2eaf5;
+  letter-spacing: .2px;
+  border-bottom: 1px solid rgba(14,165,233,.12);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.logo-icon { font-size: 18px; }
+
+#status-pill {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 16px;
+  font-size: 11.5px;
+  color: var(--sidebar-muted);
+  border-bottom: 1px solid rgba(14,165,233,.08);
+}
+#status-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--sidebar-muted);
+  flex-shrink: 0;
+}
+#status-dot.ok  { background: var(--ok); box-shadow: 0 0 6px rgba(16,185,129,.5); }
+#status-dot.bad { background: var(--danger); }
+
+/* ── conversations section ── */
+#conv-section {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
+}
+
+#new-conv-btn {
+  margin: 10px 12px 6px;
+  padding: 8px 12px;
+  background: rgba(14,165,233,.1);
+  color: #38bdf8;
+  border: 1px solid rgba(14,165,233,.18);
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+  width: calc(100% - 24px);
+  transition: background .15s, border-color .15s, color .15s;
+  flex-shrink: 0;
+}
+#new-conv-btn:hover { background: rgba(14,165,233,.18); border-color: rgba(14,165,233,.35); color: #7dd3fc; }
+
+#conv-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 2px 0 4px;
+}
+#conv-list::-webkit-scrollbar { width: 3px; }
+#conv-list::-webkit-scrollbar-track { background: transparent; }
+#conv-list::-webkit-scrollbar-thumb { background: rgba(14,165,233,.2); border-radius: 99px; }
+
+.conv-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px 7px 16px;
+  cursor: pointer;
+  color: var(--sidebar-text);
+  border-left: 2px solid transparent;
+  transition: background .1s;
+}
+.conv-item:hover { background: rgba(255,255,255,.04); }
+.conv-item.active { background: rgba(14,165,233,.1); border-left-color: #0ea5e9; }
+.conv-meta { flex: 1; overflow: hidden; }
+.conv-title {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--sidebar-text);
+}
+.conv-item.active .conv-title { color: #38bdf8; }
+.conv-time { font-size: 10px; color: var(--sidebar-muted); margin-top: 1px; }
+.conv-del {
+  width: 18px; height: 18px;
+  border: none; background: none;
+  color: #3a4f6a;
+  cursor: pointer; font-size: 14px;
+  border-radius: 3px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity .1s, color .1s;
+}
+.conv-item:hover .conv-del { opacity: 1; }
+.conv-del:hover { color: var(--danger); }
+.conv-empty { padding: 10px 16px; color: #3a4f6a; font-size: 12px; }
+
+/* ── documents section ── */
+#doc-section {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid rgba(14,165,233,.1);
+  flex-shrink: 0;
+}
+
+#upload-zone {
+  margin: 10px 12px 4px;
+  border: 1.5px dashed rgba(14,165,233,.25);
+  border-radius: 8px;
+  padding: 10px;
+  text-align: center;
+  color: var(--sidebar-muted);
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color .15s, background .15s, color .15s;
+  flex-shrink: 0;
+}
+#upload-zone:hover, #upload-zone.drag { border-color: #0ea5e9; background: rgba(14,165,233,.07); color: #38bdf8; }
+#upload-zone input { display: none; }
+
+#folder-input-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 2px 12px 4px;
+  flex-shrink: 0;
+}
+#folder-input-row span { font-size: 12px; color: var(--sidebar-muted); flex-shrink: 0; }
+#folder-input {
+  flex: 1;
+  background: rgba(255,255,255,.05);
+  border: 1px solid rgba(14,165,233,.15);
+  border-radius: 6px;
+  color: var(--sidebar-text);
+  font-size: 11.5px;
+  padding: 4px 8px;
+  outline: none;
+  transition: border-color .15s;
+}
+#folder-input:focus { border-color: rgba(14,165,233,.4); }
+
+.section-label {
+  padding: 5px 16px 3px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .9px;
+  text-transform: uppercase;
+  color: rgba(14,165,233,.45);
+  flex-shrink: 0;
+}
+
+#scope-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px 4px;
+  font-size: 11px;
+  color: var(--sidebar-muted);
+  flex-shrink: 0;
+}
+#scope-btn {
+  background: none;
+  border: 1px solid rgba(14,165,233,.2);
+  border-radius: 5px;
+  color: #38bdf8;
+  font-size: 11px;
+  padding: 1px 7px;
+  cursor: pointer;
+  transition: background .12s, border-color .12s;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 120px;
+}
+#scope-btn:hover { background: rgba(14,165,233,.1); border-color: rgba(14,165,233,.4); }
+#scope-btn.active { background: rgba(14,165,233,.15); border-color: #0ea5e9; color: #7dd3fc; }
+#clear-all-btn {
+  background: none;
+  border: 1px solid rgba(239,68,68,.25);
+  border-radius: 5px;
+  color: rgba(239,68,68,.65);
+  font-size: 11px;
+  padding: 1px 7px;
+  cursor: pointer;
+  transition: background .12s, border-color .12s;
+}
+#clear-all-btn:hover { background: rgba(239,68,68,.08); border-color: rgba(239,68,68,.5); color: #f87171; }
+
+#doc-list { overflow-y: auto; max-height: 140px; padding: 2px 0 6px; }
+#doc-list::-webkit-scrollbar { width: 3px; }
+#doc-list::-webkit-scrollbar-track { background: transparent; }
+#doc-list::-webkit-scrollbar-thumb { background: rgba(14,165,233,.2); border-radius: 99px; }
+
+.folder-group-header {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 12px 3px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--sidebar-muted);
+  cursor: pointer;
+  user-select: none;
+  transition: color .12s;
+}
+.folder-group-header:hover { color: #38bdf8; }
+.folder-group-header.scoped { color: #38bdf8; }
+.folder-toggle { font-size: 9px; flex-shrink: 0; }
+.folder-name-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-count { font-size: 10px; opacity: .7; flex-shrink: 0; }
+
+.doc-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px 5px 22px;
+  color: var(--sidebar-text);
+  font-size: 12px;
+  cursor: default;
+}
+.doc-item:hover { background: rgba(255,255,255,.03); }
+.doc-icon { font-size: 13px; flex-shrink: 0; }
+.doc-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.doc-chunks { font-size: 10px; color: var(--sidebar-muted); flex-shrink: 0; }
+.doc-del {
+  width: 18px; height: 18px;
+  border: none; background: none;
+  color: #3a4f6a;
+  cursor: pointer; font-size: 14px;
+  border-radius: 3px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity .1s, color .1s;
+}
+.doc-item:hover .doc-del { opacity: 1; }
+.doc-del:hover { color: var(--danger); }
+.doc-move {
+  width: 18px; height: 18px;
+  border: none; background: none;
+  color: #3a4f6a;
+  cursor: pointer; font-size: 11px;
+  border-radius: 3px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity .1s, color .1s;
+}
+.doc-item:hover .doc-move { opacity: 1; }
+.doc-move:hover { color: #38bdf8; }
+
+#progress-bar {
+  display: none;
+  margin: 0 12px 2px;
+  height: 3px;
+  background: rgba(14,165,233,.1);
+  border-radius: 99px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+#progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #0ea5e9, #38bdf8); transition: width .3s; }
+#ingest-label { padding: 0 12px 4px; font-size: 11px; color: var(--sidebar-muted); min-height: 16px; flex-shrink: 0; }
+
+.toast {
+  position: fixed;
+  bottom: 24px; left: 50%;
+  transform: translateX(-50%) translateY(12px);
+  background: #0f172a; color: #e2eaf5;
+  padding: 10px 22px;
+  border-radius: 10px;
+  font-size: 13px; font-weight: 500;
+  opacity: 0;
+  transition: opacity .25s, transform .25s;
+  pointer-events: none;
+  z-index: 1000;
+  white-space: nowrap;
+  box-shadow: 0 4px 20px rgba(0,0,0,.35);
+}
+.toast.show  { opacity: 1; transform: translateX(-50%) translateY(0); }
+.toast.error { background: var(--danger); color: #fff; }
+
+/* ── main ── */
+#main { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: var(--bg); }
+
+#messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 32px 24px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+#messages::-webkit-scrollbar { width: 5px; }
+#messages::-webkit-scrollbar-track { background: transparent; }
+#messages::-webkit-scrollbar-thumb { background: rgba(0,0,0,.1); border-radius: 99px; }
+@media (prefers-color-scheme: dark) { #messages::-webkit-scrollbar-thumb { background: rgba(255,255,255,.08); } }
+
+.msg-row { display: flex; flex-direction: column; max-width: 780px; width: 100%; }
+.msg-row.user      { align-self: flex-end;  align-items: flex-end; }
+.msg-row.assistant { align-self: flex-start; }
+
+.msg-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .5px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 5px;
+  padding: 0 4px;
+}
+
+.bubble {
+  padding: 13px 17px;
+  border-radius: 16px;
+  line-height: 1.65;
+  word-break: break-word;
+}
+.msg-row.user .bubble {
+  background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%);
+  color: #fff;
+  border-bottom-right-radius: 4px;
+  white-space: pre-wrap;
+  box-shadow: 0 2px 10px rgba(14,165,233,.28);
+}
+.msg-row.assistant .bubble {
+  background: var(--bubble-assistant);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 4px;
+  white-space: pre-wrap;
+  box-shadow: 0 1px 5px rgba(0,0,0,.06);
+}
+
+/* markdown elements inside assistant bubbles */
+.bubble.md { white-space: normal; }
+.bubble.md p  { margin: 0 0 .65em; }
+.bubble.md p:last-child { margin-bottom: 0; }
+.bubble.md h3, .bubble.md h4 { font-size: 14px; font-weight: 700; margin: .8em 0 .3em; }
+.bubble.md ol, .bubble.md ul { padding-left: 20px; margin: .3em 0 .65em; }
+.bubble.md li  { margin: .2em 0; line-height: 1.65; }
+.bubble.md strong { font-weight: 600; }
+.bubble.md em { font-style: italic; }
+.bubble.md code {
+  background: rgba(14,165,233,.1);
+  color: #0284c7;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: ui-monospace, "SFMono-Regular", monospace;
+  font-size: 12.5px;
+}
+@media (prefers-color-scheme: dark) { .bubble.md code { background: rgba(14,165,233,.15); color: #38bdf8; } }
+.bubble.md pre {
+  background: #f1f5fb;
+  border: 1px solid #dde4ef;
+  padding: 12px 14px;
+  border-radius: 9px;
+  overflow-x: auto;
+  margin: .4em 0 .7em;
+}
+@media (prefers-color-scheme: dark) { .bubble.md pre { background: #0a1628; border-color: #1a2b42; } }
+.bubble.md pre code { background: none; padding: 0; color: var(--text); }
+.bubble.md table { border-collapse: collapse; width: 100%; margin: .5em 0 .8em; font-size: 13px; }
+.bubble.md th, .bubble.md td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+.bubble.md th { background: rgba(14,165,233,.07); font-weight: 600; color: var(--text); }
+.bubble.md tr:nth-child(even) td { background: rgba(14,165,233,.03); }
+@media (prefers-color-scheme: dark) {
+  .bubble.md th { background: rgba(14,165,233,.1); }
+  .bubble.md tr:nth-child(even) td { background: rgba(14,165,233,.05); }
+}
+
+.sources {
+  margin-top: 9px;
+  display: flex; flex-wrap: wrap; gap: 6px;
+}
+.source-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 10px;
+  background: rgba(14,165,233,.07);
+  border: 1px solid rgba(14,165,233,.2);
+  border-radius: 99px;
+  font-size: 11px;
+  color: #0ea5e9;
+  transition: background .12s;
+}
+.source-chip:hover { background: rgba(14,165,233,.14); }
+.source-chip::before { content: "📄"; font-size: 10px; }
+
+.empty-state {
+  margin: auto;
+  text-align: center;
+  color: var(--text-muted);
+  padding: 40px 20px;
+  user-select: none;
+}
+.empty-state .es-logo { max-width: 260px; width: 100%; opacity: .92; margin-bottom: 18px; }
+.empty-state .es-icon { font-size: 38px; margin-bottom: 14px; opacity: .6; }
+.empty-state h2 { font-size: 22px; font-weight: 700; color: var(--text); margin-bottom: 8px; letter-spacing: -.3px; }
+.empty-state p  { font-size: 13.5px; line-height: 1.75; max-width: 280px; margin: 0 auto; }
+@media (prefers-color-scheme: dark) { .empty-state .es-logo { filter: invert(1) hue-rotate(180deg) brightness(1.1); } }
+
+.thinking {
+  display: flex; gap: 5px; align-items: center;
+  padding: 13px 17px;
+  background: var(--bubble-assistant);
+  border: 1px solid var(--border);
+  border-radius: 16px; border-bottom-left-radius: 4px;
+  width: fit-content;
+  box-shadow: 0 1px 5px rgba(0,0,0,.06);
+}
+.thinking span {
+  width: 7px; height: 7px;
+  background: #0ea5e9;
+  border-radius: 50%;
+  animation: blink 1.2s infinite;
+}
+.thinking span:nth-child(2) { animation-delay: .2s; }
+.thinking span:nth-child(3) { animation-delay: .4s; }
+@keyframes blink { 0%,80%,100% { opacity:.15 } 40% { opacity:1 } }
+
+/* ── login overlay ── */
+#login-overlay {
+  position: fixed; inset: 0;
+  background: rgba(7,11,20,.92);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 9000;
+}
+#login-box {
+  background: #0c1424;
+  border: 1px solid rgba(14,165,233,.2);
+  border-radius: 16px;
+  padding: 36px 40px;
+  width: 340px;
+  display: flex; flex-direction: column; gap: 16px;
+  box-shadow: 0 8px 40px rgba(0,0,0,.5);
+}
+#login-box h2 { color: #e2eaf5; font-size: 20px; font-weight: 700; text-align: center; }
+#login-box p  { color: var(--sidebar-muted); font-size: 12.5px; text-align: center; margin-top: -8px; }
+.login-field { display: flex; flex-direction: column; gap: 5px; }
+.login-field label { font-size: 12px; color: var(--sidebar-muted); }
+.login-field input {
+  padding: 9px 12px;
+  background: rgba(255,255,255,.05);
+  border: 1px solid rgba(14,165,233,.2);
+  border-radius: 8px;
+  color: #e2eaf5; font-size: 13.5px;
+  outline: none;
+  transition: border-color .15s;
+}
+.login-field input:focus { border-color: #0ea5e9; }
+#login-submit {
+  padding: 10px;
+  background: #0ea5e9; color: #fff;
+  border: none; border-radius: 9px;
+  font-size: 14px; font-weight: 600;
+  cursor: pointer;
+  transition: background .15s;
+  margin-top: 4px;
+}
+#login-submit:hover { background: #0284c7; }
+#login-error { color: var(--danger); font-size: 12px; text-align: center; min-height: 16px; }
+
+/* ── user pill in sidebar header ── */
+#user-pill {
+  display: flex; align-items: center; gap: 7px;
+  padding: 6px 16px 8px;
+  font-size: 11.5px;
+  color: var(--sidebar-muted);
+  border-bottom: 1px solid rgba(14,165,233,.08);
+}
+#user-pill .user-name { flex: 1; color: #38bdf8; font-weight: 500; }
+#user-pill .user-role { font-size: 10px; background: rgba(14,165,233,.12); color: #38bdf8; padding: 1px 6px; border-radius: 99px; }
+#logout-btn {
+  background: none; border: none; color: #3a4f6a; cursor: pointer;
+  font-size: 12px; padding: 1px 5px; border-radius: 4px;
+  transition: color .12s;
+}
+#logout-btn:hover { color: var(--danger); }
+
+/* ── access selector in upload ── */
+#access-row {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 12px 4px; font-size: 11.5px; color: var(--sidebar-muted);
+  flex-shrink: 0;
+}
+#access-row label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+#access-row input[type=radio] { accent-color: #0ea5e9; }
+
+/* ── admin panel ── */
+#admin-panel {
+  position: fixed; inset: 0;
+  background: rgba(7,11,20,.92);
+  display: none; align-items: center; justify-content: center;
+  z-index: 8000;
+}
+#admin-panel.open { display: flex; }
+#admin-box {
+  background: #0c1424;
+  border: 1px solid rgba(14,165,233,.2);
+  border-radius: 16px;
+  padding: 28px 32px;
+  width: 480px; max-height: 80vh;
+  overflow-y: auto;
+  display: flex; flex-direction: column; gap: 16px;
+  box-shadow: 0 8px 40px rgba(0,0,0,.5);
+}
+#admin-box h2 { color: #e2eaf5; font-size: 18px; font-weight: 700; }
+.admin-close { float: right; background: none; border: none; color: #3a4f6a; cursor: pointer; font-size: 20px; }
+.admin-close:hover { color: var(--danger); }
+.admin-section { display: flex; flex-direction: column; gap: 8px; }
+.admin-section h3 { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .8px; color: rgba(14,165,233,.6); }
+.user-row { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: rgba(255,255,255,.03); border-radius: 8px; }
+.user-row .u-name { flex: 1; font-size: 13px; color: #e2eaf5; }
+.user-row .u-role { font-size: 11px; background: rgba(14,165,233,.12); color: #38bdf8; padding: 1px 7px; border-radius: 99px; }
+.user-row button { background: none; border: 1px solid rgba(14,165,233,.2); border-radius: 5px; color: #38bdf8; font-size: 11px; padding: 2px 8px; cursor: pointer; }
+.user-row button:hover { background: rgba(14,165,233,.1); }
+.user-row .del-user { border-color: rgba(239,68,68,.3); color: var(--danger); }
+.user-row .del-user:hover { background: rgba(239,68,68,.1); }
+.admin-form { display: flex; gap: 6px; flex-wrap: wrap; }
+.admin-form input, .admin-form select {
+  flex: 1; min-width: 100px; padding: 6px 10px;
+  background: rgba(255,255,255,.05); border: 1px solid rgba(14,165,233,.2);
+  border-radius: 7px; color: #e2eaf5; font-size: 13px; outline: none;
+}
+.admin-form button {
+  padding: 6px 14px; background: #0ea5e9; color: #fff;
+  border: none; border-radius: 7px; font-size: 13px; cursor: pointer;
+}
+.admin-form button:hover { background: #0284c7; }
+
+/* ── input bar ── */
+#input-bar {
+  padding: 10px 20px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+#input-wrap { position: relative; }
+#question {
+  width: 100%;
+  padding: 12px 52px 12px 16px;
+  border: 1.5px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg); color: var(--text);
+  font-size: 14px; font-family: inherit;
+  resize: none; max-height: 140px; line-height: 1.5;
+  outline: none;
+  transition: border-color .15s, box-shadow .15s;
+  display: block;
+}
+#question:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(14,165,233,.12); }
+#send-btn {
+  position: absolute;
+  right: 8px; bottom: 7px;
+  width: 34px; height: 34px;
+  background: var(--accent); color: #fff;
+  border: none; border-radius: 9px;
+  font-size: 17px;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: background .15s, transform .1s, opacity .15s;
+}
+#send-btn:hover:not(:disabled) { background: var(--accent-hover); transform: scale(1.06); }
+#send-btn:disabled { opacity: .35; cursor: not-allowed; transform: none; }
+</style>
+</head>
+<body>
+<!-- Login overlay (shown only when AUTH_ENABLED and not logged in) -->
+<div id="login-overlay" style="display:none">
+  <div id="login-box">
+    <h2>🛰 Geo-Assist</h2>
+    <p>Sign in to continue</p>
+    <div class="login-field">
+      <label for="login-user">Username</label>
+      <input type="text" id="login-user" autocomplete="username" placeholder="username">
+    </div>
+    <div class="login-field">
+      <label for="login-pass">Password</label>
+      <input type="password" id="login-pass" autocomplete="current-password" placeholder="password">
+    </div>
+    <div id="login-error"></div>
+    <button id="login-submit" onclick="doLogin()">Sign in</button>
+  </div>
+</div>
+
+<!-- Admin panel -->
+<div id="admin-panel">
+  <div id="admin-box">
+    <h2>User Management <button class="admin-close" onclick="closeAdmin()">×</button></h2>
+    <div class="admin-section">
+      <h3>Users</h3>
+      <div id="admin-user-list"></div>
+    </div>
+    <div class="admin-section">
+      <h3>Add user</h3>
+      <div class="admin-form">
+        <input type="text" id="new-user-name" placeholder="Username">
+        <input type="password" id="new-user-pass" placeholder="Password">
+        <select id="new-user-role">
+          <option value="user">User</option>
+          <option value="admin">Admin</option>
+        </select>
+        <button onclick="addUser()">Add</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="app">
+  <nav id="sidebar">
+    <div class="logo"><span class="logo-icon">🛰</span>Geo-Assist</div>
+    <div id="user-pill" style="display:none">
+      <span class="user-name" id="user-name-label"></span>
+      <span class="user-role" id="user-role-label"></span>
+      <button id="logout-btn" onclick="logout()" title="Sign out">Sign out</button>
+      <button id="admin-btn" style="display:none;background:none;border:1px solid rgba(14,165,233,.2);border-radius:4px;color:#38bdf8;font-size:11px;padding:1px 6px;cursor:pointer" onclick="openAdmin()">⚙ Admin</button>
+    </div>
+    <div id="status-pill">
+      <div id="status-dot"></div>
+      <span id="status-text">Connecting…</span>
+    </div>
+
+    <div id="conv-section">
+      <button id="new-conv-btn" onclick="newConversation()">＋ New conversation</button>
+      <div class="section-label">Conversations</div>
+      <div id="conv-list"><div class="conv-empty">No conversations yet</div></div>
+    </div>
+
+    <div id="doc-section">
+      <label id="upload-zone">
+        <input type="file" id="file-input" multiple>
+        <div>⬆ Upload documents</div>
+        <div style="font-size:11px;margin-top:2px">PDF · DOCX · Code · Audio · Video · more</div>
+      </label>
+      <div id="folder-input-row">
+        <span>📁</span>
+        <input type="text" id="folder-input" placeholder="General" list="folder-suggestions">
+        <datalist id="folder-suggestions"></datalist>
+      </div>
+      <div id="access-row" style="display:none">
+        <label><input type="radio" name="access" value="public" checked> 🌐 Public</label>
+        <label><input type="radio" name="access" value="private"> 🔒 Private</label>
+      </div>
+      <div id="progress-bar"><div id="progress-fill"></div></div>
+      <div id="ingest-label"></div>
+      <div style="display:flex;align-items:center;padding:5px 12px 0;">
+        <div class="section-label" style="padding:0;flex:1">Documents</div>
+        <div id="scope-bar" style="padding:0">
+          <button id="clear-all-btn" onclick="clearAllDocs()">Clear all</button>
+          <button id="scope-btn" onclick="toggleScope()">All folders</button>
+        </div>
+      </div>
+      <div id="doc-list"><div style="padding:6px 16px;color:#4a4f5a;font-size:12px">No documents yet</div></div>
+    </div>
+  </nav>
+
+  <div id="main">
+    <div id="messages">
+      <div class="empty-state">
+        <img class="es-logo" src="/static/geocosmos_icon.png" alt="GeoCosmos">
+        <h2>Geo-Assist</h2>
+        <p>Upload a document in the sidebar,<br>then ask a question below.</p>
+      </div>
+    </div>
+    <div id="input-bar">
+      <div id="input-wrap">
+        <textarea id="question" rows="1" placeholder="Ask a question about your documents…"></textarea>
+        <button id="send-btn" disabled>&#9658;</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="toast" class="toast"></div>
+
+<script>
+const API = '';
+
+// ── auth ──────────────────────────────────────────────────────────────────────
+let _authToken = null;
+let _currentUserInfo = null;
+
+function _authHeaders() {
+  return _authToken ? { 'Authorization': `Bearer ${_authToken}` } : {};
+}
+
+function _apiFetch(url, opts = {}) {
+  opts.headers = { ...(opts.headers || {}), ..._authHeaders() };
+  return fetch(url, opts);
+}
+
+async function initAuth() {
+  const me = await _apiFetch(`${API}/auth/me`).then(r => r.json()).catch(() => ({}));
+  if (!me.auth_enabled) return; // auth is off — continue normally
+
+  _authToken = localStorage.getItem('ga-token');
+  if (_authToken) {
+    // Verify token is still valid
+    const meAuth = await _apiFetch(`${API}/auth/me`).then(r => r.json()).catch(() => null);
+    if (meAuth && meAuth.username) {
+      _currentUserInfo = meAuth;
+      showUserPill(meAuth);
+      return;
+    }
+    localStorage.removeItem('ga-token');
+    _authToken = null;
+  }
+  showLoginOverlay();
+}
+
+function showLoginOverlay() {
+  document.getElementById('login-overlay').style.display = 'flex';
+}
+
+function showUserPill(user) {
+  document.getElementById('login-overlay').style.display = 'none';
+  const pill = document.getElementById('user-pill');
+  pill.style.display = 'flex';
+  document.getElementById('user-name-label').textContent = user.username;
+  document.getElementById('user-role-label').textContent = user.role;
+  if (user.role === 'admin') {
+    document.getElementById('admin-btn').style.display = '';
+    document.getElementById('access-row').style.display = 'flex';
+  }
+}
+
+async function doLogin() {
+  const username = document.getElementById('login-user').value.trim();
+  const password = document.getElementById('login-pass').value;
+  const errEl = document.getElementById('login-error');
+  errEl.textContent = '';
+  if (!username || !password) { errEl.textContent = 'Enter username and password'; return; }
+
+  // First-time setup: if no users exist yet, use /auth/setup
+  const meCheck = await fetch(`${API}/auth/me`).then(r => r.json()).catch(() => ({}));
+  const setupEndpoint = meCheck.auth_enabled ? '/auth/login' : null;
+  if (!setupEndpoint) return;
+
+  const r = await fetch(`${API}${setupEndpoint}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  const body = await r.json();
+  if (!r.ok) { errEl.textContent = body.detail || 'Login failed'; return; }
+
+  _authToken = body.token;
+  _currentUserInfo = { username: body.username, role: body.role };
+  localStorage.setItem('ga-token', _authToken);
+  showUserPill(_currentUserInfo);
+  loadDocs();
+}
+
+document.getElementById('login-pass')?.addEventListener('keydown', e => {
+  if (e.key === 'Enter') doLogin();
+});
+
+function logout() {
+  localStorage.removeItem('ga-token');
+  _authToken = null;
+  _currentUserInfo = null;
+  document.getElementById('user-pill').style.display = 'none';
+  showLoginOverlay();
+}
+
+// ── admin panel ───────────────────────────────────────────────────────────────
+function openAdmin() {
+  document.getElementById('admin-panel').classList.add('open');
+  loadAdminUsers();
+}
+function closeAdmin() {
+  document.getElementById('admin-panel').classList.remove('open');
+}
+
+async function loadAdminUsers() {
+  const { users } = await _apiFetch(`${API}/auth/users`).then(r => r.json());
+  const list = document.getElementById('admin-user-list');
+  list.innerHTML = users.map(u => `
+    <div class="user-row">
+      <span class="u-name">${escHtml(u.username)}</span>
+      <span class="u-role">${escHtml(u.role)}</span>
+      <button onclick="changeRole('${escHtml(u.username)}','${u.role === 'admin' ? 'user' : 'admin'}')">
+        Make ${u.role === 'admin' ? 'user' : 'admin'}
+      </button>
+      <button class="del-user" onclick="deleteUser('${escHtml(u.username)}')">Delete</button>
+    </div>
+  `).join('');
+}
+
+async function addUser() {
+  const u = document.getElementById('new-user-name').value.trim();
+  const p = document.getElementById('new-user-pass').value;
+  const r = document.getElementById('new-user-role').value;
+  if (!u || !p) return;
+  await _apiFetch(`${API}/auth/users`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: u, password: p, role: r }),
+  });
+  document.getElementById('new-user-name').value = '';
+  document.getElementById('new-user-pass').value = '';
+  loadAdminUsers();
+}
+
+async function changeRole(username, newRole) {
+  await _apiFetch(`${API}/auth/users/${username}/role`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role: newRole }),
+  });
+  loadAdminUsers();
+}
+
+async function deleteUser(username) {
+  if (!confirm(`Delete user "${username}"?`)) return;
+  await _apiFetch(`${API}/auth/users/${username}`, { method: 'DELETE' });
+  loadAdminUsers();
+}
+
+// ── health poll ───────────────────────────────────────────────────────────────
+let _healthFailures = 0;
+async function pollHealth() {
+  try {
+    const h = await _apiFetch(`${API}/health`).then(r => r.json());
+    const dot  = document.getElementById('status-dot');
+    const text = document.getElementById('status-text');
+    if (h.ollama) {
+      _healthFailures = 0;
+      dot.className = 'ok';
+      text.textContent = h.chat_model;
+    } else {
+      _healthFailures++;
+      if (_healthFailures >= 2) { dot.className = 'bad'; text.textContent = 'Ollama not running'; }
+    }
+  } catch {
+    _healthFailures++;
+    if (_healthFailures >= 2) {
+      document.getElementById('status-dot').className = 'bad';
+      document.getElementById('status-text').textContent = 'Backend offline';
+    }
+  }
+}
+pollHealth();
+setInterval(pollHealth, 8000);
+
+// ── markdown renderer ─────────────────────────────────────────────────────────
+function renderMarkdown(raw) {
+  const lines = escHtml(raw).split('\n');
+  const blocks = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Fenced code block
+    if (line.startsWith('```')) {
+      let code = '';
+      i++;
+      while (i < lines.length && !lines[i].startsWith('```')) { code += lines[i] + '\n'; i++; }
+      blocks.push(`<pre><code>${code.trimEnd()}</code></pre>`);
+      i++;
+      continue;
+    }
+
+    // Heading (# ## ###)
+    const hm = line.match(/^(#{1,3}) (.+)/);
+    if (hm) {
+      const level = Math.min(hm[1].length + 2, 6);
+      blocks.push(`<h${level}>${inlineMd(hm[2])}</h${level}>`);
+      i++;
+      continue;
+    }
+
+    // Markdown table — collect consecutive pipe-delimited rows
+    if (/^\|/.test(line)) {
+      const tableLines = [];
+      while (i < lines.length && /^\|/.test(lines[i])) {
+        tableLines.push(lines[i]);
+        i++;
+      }
+      // tableLines[0] = header, tableLines[1] = separator (---)
+      if (tableLines.length >= 2) {
+        const parseCells = row => row.split('|').slice(1, -1).map(c => inlineMd(c.trim()));
+        const headers = parseCells(tableLines[0]);
+        let html = '<table><thead><tr>' + headers.map(h => `<th>${h}</th>`).join('') + '</tr></thead><tbody>';
+        for (let r = 2; r < tableLines.length; r++) {
+          const cells = parseCells(tableLines[r]);
+          html += '<tr>' + cells.map(c => `<td>${c}</td>`).join('') + '</tr>';
+        }
+        html += '</tbody></table>';
+        blocks.push(html);
+      }
+      continue;
+    }
+
+    // Ordered list — collect consecutive items
+    if (/^\d+\. /.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\d+\. /.test(lines[i])) {
+        items.push(`<li>${inlineMd(lines[i].replace(/^\d+\. /, ''))}</li>`);
+        i++;
+      }
+      blocks.push(`<ol>${items.join('')}</ol>`);
+      continue;
+    }
+
+    // Unordered list — collect consecutive items
+    if (/^[*-] /.test(line)) {
+      const items = [];
+      while (i < lines.length && /^[*-] /.test(lines[i])) {
+        items.push(`<li>${inlineMd(lines[i].replace(/^[*-] /, ''))}</li>`);
+        i++;
+      }
+      blocks.push(`<ul>${items.join('')}</ul>`);
+      continue;
+    }
+
+    // Blank line — skip
+    if (!line.trim()) { i++; continue; }
+
+    // Paragraph — collect until blank line or block-level marker
+    const paraLines = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() &&
+      !/^(#{1,3} |```|\d+\. |[*-] )/.test(lines[i])
+    ) {
+      paraLines.push(inlineMd(lines[i]));
+      i++;
+    }
+    if (paraLines.length) blocks.push(`<p>${paraLines.join('<br>')}</p>`);
+  }
+
+  return blocks.join('');
+}
+
+function inlineMd(text) {
+  return text
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*\n]+)\*/g,     '<em>$1</em>')
+    .replace(/`([^`\n]+)`/g,       '<code>$1</code>');
+}
+
+// ── documents ─────────────────────────────────────────────────────────────────
+const EXT_ICON = {
+  pdf:'📄', docx:'📝', pptx:'📊', txt:'📃', csv:'📋',
+  py:'🐍', js:'📜', ts:'📜', jsx:'📜', tsx:'📜',
+  java:'☕', c:'⚙️', cpp:'⚙️', h:'⚙️', hpp:'⚙️', cs:'⚙️', go:'🐹',
+  rs:'🦀', rb:'💎', php:'🐘', swift:'🍎', kt:'🟣', scala:'🔴',
+  sh:'🖥️', ps1:'🖥️', bat:'🖥️',
+  json:'📋', yaml:'📋', yml:'📋', toml:'📋', sql:'🗃️', md:'📘',
+  html:'🌐', css:'🎨', xml:'📋',
+  mp3:'🎵', mp4:'🎬', wav:'🎵', m4a:'🎵', webm:'🎬',
+};
+
+let _activeFolder = null;
+let _collapsedFolders = new Set();
+
+async function loadDocs() {
+  const [{ documents }, { folders }] = await Promise.all([
+    _apiFetch(`${API}/documents`).then(r => r.json()),
+    _apiFetch(`${API}/folders`).then(r => r.json()),
+  ]);
+
+  // Update datalist for folder suggestions
+  const dl = document.getElementById('folder-suggestions');
+  dl.innerHTML = folders.map(f => `<option value="${escHtml(f)}">`).join('');
+
+  const list = document.getElementById('doc-list');
+  if (!documents.length) {
+    list.innerHTML = '<div style="padding:6px 16px;color:#4a4f5a;font-size:12px">No documents yet</div>';
+    updateScopeBtn(folders);
+    return;
+  }
+
+  // Group by folder
+  const byFolder = {};
+  for (const d of documents) {
+    const f = d.folder || 'General';
+    if (!byFolder[f]) byFolder[f] = [];
+    byFolder[f].push(d);
+  }
+
+  const folderNames = Object.keys(byFolder).sort();
+  let html = '';
+  for (const folderName of folderNames) {
+    const docs = byFolder[folderName];
+    const collapsed = _collapsedFolders.has(folderName);
+    const isScoped = _activeFolder === folderName;
+    html += `<div class="folder-group-header ${isScoped ? 'scoped' : ''}" onclick="toggleFolder('${escHtml(folderName)}')">
+      <span class="folder-toggle">${collapsed ? '▶' : '▼'}</span>
+      <span class="folder-name-label" title="${escHtml(folderName)}">📁 ${escHtml(folderName)}</span>
+      <span class="folder-count">${docs.length}</span>
+    </div>`;
+    if (!collapsed) {
+      for (const d of docs) {
+        const ext = d.filename.split('.').pop().toLowerCase();
+        const icon = EXT_ICON[ext] || '📄';
+        const safeName = escHtml(d.filename);
+        const safeId = escHtml(d.doc_id);
+        html += `<div class="doc-item" data-id="${safeId}">
+          <span class="doc-icon">${icon}</span>
+          <span class="doc-name" title="${safeName}">${safeName}</span>
+          <span class="doc-chunks">${d.chunks}</span>
+          <button class="doc-move" title="Move to folder" onclick="moveDoc('${safeId}','${escHtml(folderName)}',this)">📁</button>
+          <button class="doc-del" title="Remove" onclick="deleteDoc('${safeId}',this)">×</button>
+        </div>`;
+      }
+    }
+  }
+  list.innerHTML = html;
+  updateScopeBtn(folderNames);
+}
+
+function toggleFolder(name) {
+  if (_collapsedFolders.has(name)) _collapsedFolders.delete(name);
+  else _collapsedFolders.add(name);
+  loadDocs();
+}
+
+function updateScopeBtn(folders) {
+  const btn = document.getElementById('scope-btn');
+  if (_activeFolder) {
+    btn.textContent = _activeFolder;
+    btn.classList.add('active');
+  } else {
+    btn.textContent = 'All folders';
+    btn.classList.remove('active');
+  }
+}
+
+function toggleScope() {
+  // Build a quick folder list from the current doc list headers
+  const headers = document.querySelectorAll('.folder-group-header .folder-name-label');
+  const available = [...headers].map(h => h.title);
+  if (!available.length) return;
+
+  if (!_activeFolder) {
+    _activeFolder = available[0];
+  } else {
+    const idx = available.indexOf(_activeFolder);
+    _activeFolder = idx >= 0 && idx < available.length - 1 ? available[idx + 1] : null;
+  }
+  updateScopeBtn(available);
+  loadDocs();
+}
+
+async function deleteDoc(docId, btn) {
+  btn.disabled = true;
+  await _apiFetch(`${API}/documents/${docId}`, { method: 'DELETE' });
+  loadDocs();
+}
+
+async function clearAllDocs() {
+  if (!confirm('Delete ALL documents from the knowledge base? This cannot be undone.')) return;
+  const btn = document.getElementById('clear-all-btn');
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    await _apiFetch(`${API}/documents`, { method: 'DELETE' });
+    loadDocs();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Clear all';
+  }
+}
+
+async function moveDoc(docId, currentFolder, btn) {
+  const newFolder = prompt('Move to folder:', currentFolder);
+  if (!newFolder || newFolder.trim() === currentFolder) return;
+  btn.disabled = true;
+  await _apiFetch(`${API}/documents/${docId}/folder`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folder: newFolder.trim() }),
+  });
+  loadDocs();
+}
+
+loadDocs();
+
+// ── upload ────────────────────────────────────────────────────────────────────
+const zone  = document.getElementById('upload-zone');
+const input = document.getElementById('file-input');
+const bar   = document.getElementById('progress-bar');
+const fill  = document.getElementById('progress-fill');
+
+let _ingestLocked = false;
+
+function setIngestLock(locked) {
+  _ingestLocked = locked;
+  sendBtn.disabled = locked || !qInput.value.trim();
+  qInput.placeholder = locked
+    ? 'Documents are being processed — please wait…'
+    : 'Ask a question about your documents…';
+}
+
+function setIngestLabel(text) { document.getElementById('ingest-label').textContent = text; }
+
+function showToast(msg, isError = false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (isError ? ' error' : '');
+  setTimeout(() => { t.className = 'toast'; }, 4000);
+}
+
+zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('drag'); });
+zone.addEventListener('dragleave', () => zone.classList.remove('drag'));
+zone.addEventListener('drop', async e => {
+  e.preventDefault();
+  zone.classList.remove('drag');
+  const items = [...e.dataTransfer.items];
+  const entries = items.map(i => i.webkitGetAsEntry()).filter(Boolean);
+  // If a single directory was dropped, auto-fill folder name and read its contents
+  if (entries.length === 1 && entries[0].isDirectory) {
+    const dirEntry = entries[0];
+    const folderInput = document.getElementById('folder-input');
+    if (!folderInput.value.trim()) folderInput.value = dirEntry.name;
+    const files = await _readDirEntry(dirEntry);
+    uploadFiles(files);
+  } else {
+    uploadFiles([...e.dataTransfer.files]);
+  }
+});
+input.addEventListener('change', () => uploadFiles([...input.files]));
+
+async function _readDirEntry(dirEntry) {
+  const files = [];
+  async function readEntries(reader) {
+    // readEntries returns at most 100 items at a time — loop until empty
+    while (true) {
+      const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+      if (!batch.length) break;
+      for (const entry of batch) {
+        if (entry.isFile) {
+          const f = await new Promise((res, rej) => entry.file(res, rej));
+          files.push(f);
+        } else if (entry.isDirectory) {
+          await readEntries(entry.createReader());
+        }
+      }
+    }
+  }
+  await readEntries(dirEntry.createReader());
+  return files;
+}
+
+async function uploadFiles(files) {
+  if (!files.length) return;
+  const folder = (document.getElementById('folder-input').value || 'General').trim();
+  const accessEl = document.querySelector('input[name="access"]:checked');
+  const access = accessEl ? accessEl.value : 'public';
+  const form = new FormData();
+  files.forEach(f => form.append('files', f));
+  form.append('folder', folder);
+  form.append('access', access);
+
+  let job;
+  try {
+    const r = await _apiFetch(`${API}/ingest/bulk`, { method: 'POST', body: form });
+    job = await r.json();
+    if (!r.ok) { showToast(job.detail || 'Upload failed', true); return; }
+  } catch {
+    showToast('Upload failed — backend unreachable', true);
+    return;
+  }
+
+  input.value = '';
+  bar.style.display = 'block';
+  fill.style.width = '0%';
+  setIngestLock(true);
+  setIngestLabel(`Processing 0 / ${job.total}…`);
+  pollJob(job.job_id, job.total);
+}
+
+function pollJob(jobId, total) {
+  const iv = setInterval(async () => {
+    try {
+      const r   = await _apiFetch(`${API}/ingest/status/${jobId}`);
+      const job = await r.json();
+
+      const pct = total > 0 ? Math.round((job.prepared / total) * 100) : 0;
+      fill.style.width = pct + '%';
+      setIngestLabel(`Processing ${job.prepared} / ${total}…`);
+
+      if (job.status === 'done' || job.status === 'failed') {
+        clearInterval(iv);
+        fill.style.width = '100%';
+        setTimeout(() => { bar.style.display = 'none'; fill.style.width = '0%'; setIngestLabel(''); }, 600);
+        setIngestLock(false);
+        loadDocs();
+        if (job.status === 'done') {
+          const n = job.results.filter(r => r.status === 'ok').length;
+          showToast(`${n} document${n !== 1 ? 's' : ''} ready to query`);
+        } else {
+          showToast('Ingest failed — see console for details', true);
+          console.error('Ingest job failed', job);
+        }
+      }
+    } catch (e) { console.error('Status poll error', e); }
+  }, 1000);
+}
+
+// ── conversation management ───────────────────────────────────────────────────
+let _convs = [];
+let _currentConvId = null;
+let _currentMessages = [];
+
+function loadConvs() {
+  try { _convs = JSON.parse(localStorage.getItem('ga-convs') || '[]'); }
+  catch { _convs = []; }
+}
+
+function persistConvs() {
+  localStorage.setItem('ga-convs', JSON.stringify(_convs.slice(0, 50)));
+}
+
+function saveCurrentConv() {
+  if (!_currentConvId || _currentMessages.length === 0) return;
+  const idx = _convs.findIndex(c => c.id === _currentConvId);
+  if (idx >= 0) {
+    _convs[idx].messages  = _currentMessages;
+    _convs[idx].updatedAt = Date.now();
+    // Keep list sorted: move updated conv to top
+    _convs.unshift(_convs.splice(idx, 1)[0]);
+  } else {
+    _convs.unshift({
+      id: _currentConvId,
+      title: _currentMessages[0]?.text?.slice(0, 55) || 'New conversation',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      messages:  _currentMessages,
+    });
+  }
+  persistConvs();
+  renderConvList();
+}
+
+function newConversation() {
+  saveCurrentConv();
+  if (_currentConvId) _apiFetch(`${API}/chat/session/${_currentConvId}`, { method: 'DELETE' }).catch(() => {});
+  _currentConvId   = 'sess_' + Math.random().toString(36).slice(2);
+  _currentMessages = [];
+  chatStarted      = false;
+  msgs.innerHTML   = `<div class="empty-state"><img class="es-logo" src="/static/geocosmos_icon.png" alt="GeoCosmos"><h2>Geo-Assist</h2><p>Upload a document in the sidebar,<br>then ask a question below.</p></div>`;
+  renderConvList();
+}
+
+function switchConv(id) {
+  if (id === _currentConvId) return;
+  saveCurrentConv();
+  const conv = _convs.find(c => c.id === id);
+  if (!conv) return;
+  _currentConvId   = id;
+  _currentMessages = conv.messages ? [...conv.messages] : [];
+  // Sync backend context window to this conversation's last turns
+  const history = _currentMessages.slice(-6).map(m => ({ role: m.role, content: m.text }));
+  _apiFetch(`${API}/chat/session/${id}/restore`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages: history }),
+  }).catch(() => {});
+  msgs.innerHTML   = '';
+  chatStarted      = _currentMessages.length > 0;
+  for (const m of _currentMessages) renderMsgRow(m.role, m.text, m.sources);
+  if (!chatStarted) {
+    msgs.innerHTML = `<div class="empty-state">
+      <h2>Geo-Assist</h2>
+      <p>Upload a document in the sidebar,<br>then ask a question below.</p>
+    </div>`;
+  } else {
+    msgs.lastElementChild?.scrollIntoView({ block: 'end' });
+  }
+  renderConvList();
+}
+
+function deleteConv(id, e) {
+  e.stopPropagation();
+  const idx = _convs.findIndex(c => c.id === id);
+  if (idx >= 0) {
+    _apiFetch(`${API}/chat/session/${_convs[idx].id}`, { method: 'DELETE' }).catch(() => {});
+    _convs.splice(idx, 1);
+    persistConvs();
+  }
+  if (id === _currentConvId) {
+    _convs.length > 0 ? switchConv(_convs[0].id) : newConversation();
+  } else {
+    renderConvList();
+  }
+}
+
+function relTime(ts) {
+  const s = (Date.now() - ts) / 1000;
+  if (s < 60)   return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+function renderConvList() {
+  const list = document.getElementById('conv-list');
+  if (_convs.length === 0) {
+    list.innerHTML = '<div class="conv-empty">No conversations yet</div>';
+    return;
+  }
+  list.innerHTML = _convs.map(c => `
+    <div class="conv-item ${c.id === _currentConvId ? 'active' : ''}" onclick="switchConv('${c.id}')">
+      <div class="conv-meta">
+        <div class="conv-title" title="${escHtml(c.title)}">${escHtml(c.title)}</div>
+        <div class="conv-time">${relTime(c.updatedAt || c.createdAt)}</div>
+      </div>
+      <button class="conv-del" onclick="deleteConv('${c.id}',event)" title="Delete">×</button>
+    </div>
+  `).join('');
+}
+
+// ── scroll helper ─────────────────────────────────────────────────────────────
+function isNearBottom() {
+  return msgs.scrollHeight - msgs.scrollTop - msgs.clientHeight < 120;
+}
+function scrollToBottom() {
+  if (isNearBottom()) msgs.scrollTo({ top: msgs.scrollHeight, behavior: 'smooth' });
+}
+
+// ── chat ──────────────────────────────────────────────────────────────────────
+const msgs    = document.getElementById('messages');
+const qInput  = document.getElementById('question');
+const sendBtn = document.getElementById('send-btn');
+let chatStarted = false;
+
+qInput.addEventListener('input', () => {
+  qInput.style.height = 'auto';
+  qInput.style.height = Math.min(qInput.scrollHeight, 140) + 'px';
+  sendBtn.disabled = _ingestLocked || !qInput.value.trim();
+});
+qInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); }
+});
+sendBtn.addEventListener('click', sendMsg);
+
+function renderMsgRow(role, text, sources) {
+  const row   = document.createElement('div');
+  row.className = `msg-row ${role}`;
+  const label = role === 'user' ? 'You' : 'Geo-Assist';
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  if (role === 'assistant') {
+    bubble.classList.add('md');
+    bubble.innerHTML = renderMarkdown(text);
+  } else {
+    bubble.textContent = text;
+  }
+  row.innerHTML = `<div class="msg-label">${label}</div>`;
+  row.appendChild(bubble);
+  if (sources && sources.length) {
+    const div = document.createElement('div');
+    div.className = 'sources';
+    div.innerHTML = sources.map(s =>
+      `<span class="source-chip">${escHtml(s.filename)}${s.page > 0 ? `, p.${s.page}` : ''}</span>`
+    ).join('');
+    row.appendChild(div);
+  }
+  msgs.appendChild(row);
+  return row;
+}
+
+function addMsg(role, text, sources) {
+  if (!chatStarted) { msgs.innerHTML = ''; chatStarted = true; }
+  const row = renderMsgRow(role, text, sources);
+  row.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  _currentMessages.push({ role, text, sources: sources || [] });
+  saveCurrentConv();
+  return row;
+}
+
+function addThinking() {
+  if (!chatStarted) { msgs.innerHTML = ''; chatStarted = true; }
+  const row = document.createElement('div');
+  row.className = 'msg-row assistant';
+  row.innerHTML = `<div class="msg-label">Geo-Assist</div>
+    <div class="thinking"><span></span><span></span><span></span></div>`;
+  msgs.appendChild(row);
+  scrollToBottom();
+  return row;
+}
+
+async function sendMsg() {
+  const q = qInput.value.trim();
+  if (!q) return;
+  qInput.value = '';
+  qInput.style.height = 'auto';
+  sendBtn.disabled = true;
+
+  addMsg('user', q);
+  const thinking = addThinking();
+
+  try {
+    const resp = await _apiFetch(`${API}/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: q, session_id: _currentConvId, folder_filter: _activeFolder }),
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json();
+      thinking.remove();
+      addMsg('assistant', `Error: ${err.detail || resp.statusText}`);
+      sendBtn.disabled = false;
+      qInput.focus();
+      return;
+    }
+
+    let row = null, bubble = null, fullText = '', finalSources = [];
+    const reader  = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = JSON.parse(line.slice(6));
+
+        if (data.token !== undefined) {
+          if (!bubble) {
+            thinking.remove();
+            row = document.createElement('div');
+            row.className = 'msg-row assistant';
+            row.innerHTML = '<div class="msg-label">Geo-Assist</div>';
+            bubble = document.createElement('div');
+            bubble.className = 'bubble';   // pre-wrap while streaming
+            row.appendChild(bubble);
+            msgs.appendChild(row);
+          }
+          // Append token directly — avoids O(n²) full-string rewrite
+          fullText += data.token;
+          bubble.textContent += data.token;
+          scrollToBottom();
+        }
+
+        if (data.done) {
+          if (!bubble) { thinking.remove(); }
+          finalSources = data.sources || [];
+          if (bubble && fullText) {
+            // Replace plain-text stream with rendered markdown
+            bubble.classList.add('md');
+            bubble.innerHTML = renderMarkdown(fullText);
+          }
+          if (finalSources.length && row) {
+            const div = document.createElement('div');
+            div.className = 'sources';
+            div.innerHTML = finalSources.map(s =>
+              `<span class="source-chip">${escHtml(s.filename)}${s.page > 0 ? `, p.${s.page}` : ''}</span>`
+            ).join('');
+            row.appendChild(div);
+          }
+        }
+      }
+    }
+
+    if (!bubble) {
+      thinking.remove();
+      addMsg('assistant', 'No response received.');
+    } else {
+      _currentMessages.push({ role: 'assistant', text: fullText, sources: finalSources });
+      saveCurrentConv();
+    }
+  } catch (e) {
+    thinking.remove();
+    addMsg('assistant', `Error: ${e.message}`);
+  }
+
+  sendBtn.disabled = false;
+  qInput.focus();
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// ── init ──────────────────────────────────────────────────────────────────────
+loadConvs();
+_currentConvId = 'sess_' + Math.random().toString(36).slice(2);
+renderConvList();
+initAuth();
+</script>
+</body>
+</html>

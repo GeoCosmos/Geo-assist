@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data — ChromaDB and BM25 index are machine-local, not committed
+data/
+
+# Secrets / auth state (also covered by data/ above)
+data/users.json
+data/revocations.json
+data/secret.key
+
+# Session notes — AI handoff context, not for version control
+handoff.md
+
+# macOS
+.DS_Store
+
+# Claude Code workspace settings (developer-local, not project config)
+.claude/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Tool caches
+.ruff_cache/
+
+# Eval output
+geo-assist-eval/
