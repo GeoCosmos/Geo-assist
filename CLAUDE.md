@@ -185,31 +185,6 @@ ruff check --fix .
 
 - **ChromaDB 1.x Rust backend hangs on large databases.** `chromadb>=1.0` uses a Rust-based connection pool. On a production database ≥ 700 MB (e.g. 148k chunks), `col.count()` blocks indefinitely with `pool timed out while waiting for an open connection`. Tests pass because they use empty `tmp_path` databases. If you hit this on Windows, downgrade: `pip install "chromadb>=0.6,<1.0"` to use the Python backend.
 
-## Eval tooling
-
-Two standalone scripts for measuring system quality against a synthetic corpus:
-
-```bash
-# Generate corpus (500 docs, ~15 MB text, ~40 seconds — fully programmatic, no Ollama needed)
-python3 generate_eval_data.py
-# --skip-existing skips docs that already exist on disk (only regenerates questions.jsonl)
-# Output: ~/Desktop/geo-assist-eval/docs/  +  questions.jsonl  +  metadata.json
-
-# Run evaluation (server must be running on 8743)
-python3 eval.py                                            # 20 docs, 60 questions — ~15 min
-python3 eval.py --skip-ingest                             # skip ingest, just run questions
-python3 eval.py --skip-ingest --concurrency 3             # faster: 3 parallel queries
-python3 eval.py --docs-limit 0 --questions-limit 0 --skip-ingest --concurrency 3  # full eval
-```
-
-`eval.py` uses a Rich live terminal UI: ingest progress bar → query progress bar → per-type accuracy table updating in real time. Results saved to `~/Desktop/geo-assist-eval/eval_results.json`.
-
-Question types: `factual`, `multi-fact`, `recommendation`, `comparison`, `synthesis`, `validation`, `calculation`, `procedural`.
-Cross-doc questions (comparison/synthesis/calculation) are automatically excluded when doing a partial ingest — they require the full corpus.
-
-**Calculation expected values use 3 decimal places** (`round(sum, 3)` in `calculation_questions()`). This matches the precision of the source masses (also 3dp). If you ever regenerate with `--skip-existing`, the questions.jsonl is updated but the docs and ChromaDB are untouched.
-
-The corpus is 532 docs total: 500 system spec docs (GCA-2024-0001 through 0500), 11 domain digest docs (GCA-2024-0521 through 0531), 1 knowledge base doc, ~20 others. The digest docs are critical for synthesis questions — they contain a `COMMON RECOMMENDATION` section listing the most frequent recommendation per domain. Do not delete digest docs from ChromaDB without re-ingesting them.
 
 ## Frontend design system
 
@@ -232,7 +207,7 @@ The `#send-btn` is `position: absolute` inside `#input-wrap` — do not add `dis
 ## Phase 2 ideas (not yet implemented)
 
 - ~~Sync conversation history to backend on switch~~ — fixed.
-- ~~Image extraction from PDF/PPTX~~ — done. Set `GEO_VISION_MODEL=llava:7b` to enable.
+- ~~Image extraction from PDF/PPTX/DOCX~~ — done. Set `GEO_VISION_MODEL=moondream` (or any vision-capable Ollama model) to enable. Use `vision_index.py` to back-fill image chunks for already-ingested docs (run with server stopped to avoid RAM competition).
 - ~~DOCX/PPTX table extraction~~ — fixed. Tables rendered as markdown; PPTX grouped shapes recursed.
 - ~~CSV telemetry filter false positives~~ — fixed. CSV routed to dedicated `_extract_csv`.
 - ~~Audio/video transcription~~ — implemented. Optional install via `requirements-audio.txt`.
@@ -243,12 +218,17 @@ The `#send-btn` is `position: absolute` inside `#input-wrap` — do not add `dis
 - ~~Table-aware extraction (Phase 2)~~ — implemented. `_extract_pdf` uses `page.find_tables()` (PyMuPDF ≥1.25) and renders tables as markdown in reading order (y0-sorted interleaving of text blocks and table markdown). Documents uploaded before this was added need re-ingestion to benefit.
 - ~~Re-ranking with a cross-encoder after RRF~~ — implemented. Optional; enable with `GEO_RERANK=true`. Requires `pip install -r requirements-reranker.txt` and pre-downloading the model (needs internet once). See `reranker.py` and `config.py`.
 - ~~Delete all / clear collection endpoint~~ — implemented. `DELETE /documents` (requires auth when enabled). "Clear all" button in sidebar UI.
-- Procedure agent mode — step-by-step procedure walkthrough with conflict detection (see handoff.md for design notes).
+- ~~Procedure agent mode~~ — implemented. Each doc has a ▶ button (hover to reveal) that starts procedure mode. LLM synthesizes steps from the document content (works on specs, manuals, and descriptions — not just docs with explicit numbered lists). Current step is injected into the system prompt; model is instructed to flag conflicts against retrieved reference docs with `⚠️ CONFLICT:` warnings. See `retriever._generate_procedure_steps()`, `retriever._PROCEDURE_SYSTEM`, `retriever._build_system()`, and the `/procedure/session/*` endpoints in `main.py`.
 
-## Procedure agent (future)
+## Procedure agent
 
-Engineers want step-by-step procedure walkthrough with geo-assist as the knowledge backbone. Conversation history is now in place. Next step: build a procedure-mode prompt that ingests a procedure document and maintains step state across turns.
+Step-by-step procedure walkthrough is implemented within the main agent (no separate service). See handoff.md for full implementation notes.
 
-Target interaction: agent presents one step at a time, engineer asks questions, agent answers using retrieved context, and flags when retrieved specs conflict with what the procedure says (e.g. "Warning: procedure says 28 bar but ICD says 25 bar MEOP").
+**Key files:**
+- `retriever._generate_procedure_steps(chunks)` — async; calls the LLM with `_PROCEDURE_EXTRACT_SYSTEM` to extract or synthesize numbered steps; falls back to raw chunks on failure
+- `retriever._PROCEDURE_SYSTEM` — system prompt for procedure Q&A; injects current step, instructs conflict detection
+- `retriever._build_system(context_parts, procedure)` — picks between `_SYSTEM` and `_PROCEDURE_SYSTEM`
+- `/procedure/session/{id}/start`, `/navigate`, `DELETE` in `main.py`; state stored in `_proc_sessions`
+- `#proc-bar` in `static/index.html`; JS state in `_procState`
 
-Once you see where the conversation-history approach breaks down, decide whether to promote to a separate procedure agent service with explicit tools (`search_docs`, `next_step`, `flag_conflict`).
+**Do not** set `keep_alive: -1` unconditionally if targeting machines where RAM is tight. The current value keeps models loaded permanently; consider `keep_alive: 300` (5-minute idle unload) as an alternative.

@@ -130,3 +130,73 @@ async def test_named_doc_injected_by_filename(mock_ollama):
         result = await retriever.answer("what does safetymargin.txt say?")
 
     assert any(s["filename"] == "safetymargin.txt" for s in result["sources"])
+
+
+async def test_generate_procedure_steps_uses_llm(mock_ollama):
+    """_generate_procedure_steps calls the LLM and parses numbered output."""
+    async def fake_chat(system, user, model=None, history=None):
+        return "1. Open the valve\n2. Record the reading\n3. Close the valve"
+
+    with patch("llm.chat", side_effect=fake_chat):
+        steps = await retriever._generate_procedure_steps(
+            ["Valve system description. Nominal pressure 25 bar."]
+        )
+
+    assert len(steps) == 3
+    assert steps[0].startswith("1.")
+    assert steps[1].startswith("2.")
+    assert steps[2].startswith("3.")
+
+
+async def test_generate_procedure_steps_fallback_on_llm_failure(mock_ollama):
+    """When the LLM call fails, raw chunks are returned as steps."""
+    async def bad_chat(system, user, model=None, history=None):
+        raise RuntimeError("ollama down")
+
+    chunks = ["Chunk one.", "Chunk two."]
+    with patch("llm.chat", side_effect=bad_chat):
+        steps = await retriever._generate_procedure_steps(chunks)
+
+    assert steps == chunks
+
+
+async def test_generate_procedure_steps_fallback_on_no_numbered_output(mock_ollama):
+    """When the LLM returns no parseable numbered lines, fall back to chunks."""
+    async def fake_chat(system, user, model=None, history=None):
+        return "Here is a summary of the document without numbered steps."
+
+    chunks = ["Some document content."]
+    with patch("llm.chat", side_effect=fake_chat):
+        steps = await retriever._generate_procedure_steps(chunks)
+
+    assert steps == chunks
+
+
+async def test_procedure_mode_uses_procedure_prompt(mock_ollama):
+    """When procedure dict is passed, answer() uses the procedure system prompt."""
+    await ingest.ingest(b"ICD specifies valve torque: 30 Nm maximum.", "icd.txt")
+
+    captured_systems = []
+
+    async def fake_chat(system, user, model=None, history=None):
+        captured_systems.append(system)
+        return "Torque is 30 Nm."
+
+    proc = {
+        "doc_id": "proc_doc",
+        "filename": "procedure.pdf",
+        "steps": ["Step 1: Tighten valve to 25 Nm."],
+        "step_idx": 0,
+    }
+
+    with patch("llm.chat", side_effect=fake_chat):
+        result = await retriever.answer("What is the valve torque?", procedure=proc)
+
+    assert result["answer"] == "Torque is 30 Nm."
+    assert captured_systems, "llm.chat was never called"
+    system = captured_systems[-1]
+    assert "Procedure Mode" in system
+    assert "procedure.pdf" in system
+    assert "STEP 1 OF 1" in system
+    assert "Tighten valve to 25 Nm" in system
+    assert "CONFLICT DETECTION" in system

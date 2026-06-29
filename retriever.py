@@ -43,6 +43,47 @@ def _find_named_docs(question: str) -> list[str]:
 
 _SUMMARY_BOOST = 3.0
 
+_PROCEDURE_EXTRACT_SYSTEM = """\
+You are a technical procedure specialist. Given the content of an engineering document, \
+extract or synthesize a clear numbered step-by-step procedure that an engineer can execute \
+in the field.
+
+Rules:
+- Number steps starting at 1
+- Each step is one concrete, executable action
+- Include specific values, tolerances, part numbers, or conditions from the document
+- If the document already has explicit numbered steps, preserve and clarify them
+- If the document is a specification, manual, or description without explicit steps, \
+  infer the correct execution sequence from the content — think about what an engineer \
+  would actually do in order
+- Do not invent steps or values not supported by the document
+- Format each step as: "N. [action]" — one step per line, no sub-bullets, no headings
+- Aim for 5–20 steps; combine trivially short steps and split compound actions
+- Respond with ONLY the numbered steps — no preamble, no closing remarks
+"""
+
+_STEP_LINE_RE = re.compile(r'^\d+\.\s+.+$')
+
+
+async def _generate_procedure_steps(chunks: list[str]) -> list[str]:
+    """Call the LLM to extract or synthesize a numbered step list from document chunks.
+
+    Falls back to raw chunks if the LLM call fails or returns no parseable steps.
+    Caps input at 20 chunks to stay within the model's context window.
+    """
+    content = "\n\n".join(chunks[:20])
+    try:
+        raw = await llm.chat(
+            system=_PROCEDURE_EXTRACT_SYSTEM,
+            user=f"Document content:\n\n{content}",
+        )
+        steps = [ln.strip() for ln in raw.splitlines() if _STEP_LINE_RE.match(ln.strip())]
+        if steps:
+            return steps
+    except Exception:
+        log.warning("procedure step generation failed", exc_info=True)
+    return [c.strip() for c in chunks if c.strip()]
+
 # Included in the system prompt only when vision analysis is enabled, so the LLM
 # is not primed to look for figure annotations that will never appear.
 _FIGURE_NOTE = (
@@ -115,6 +156,40 @@ The retrieved context may be in English — that is fine; translate as needed in
 If you are not confident in a translation of a technical term, include the English term in parentheses.
 
 Retrieved context:
+{context}
+"""
+
+_PROCEDURE_SYSTEM = """\
+You are Geo-Assist in Procedure Mode. An engineer is executing a procedure step by \
+step and may ask questions, request clarification, or want you to verify specifications \
+against reference documents.
+
+CURRENT PROCEDURE: {filename}
+STEP {step_num} OF {total_steps}
+──────────────────────────────────────
+{step_text}
+──────────────────────────────────────
+
+Your responsibilities:
+1. Help the engineer understand and execute the current step.
+2. Answer questions using the retrieved reference documents shown below.
+3. CONFLICT DETECTION — if any retrieved reference document contains a specification, \
+   value, or instruction that contradicts what the current step says, output a warning \
+   immediately before your answer, in this format:
+   ⚠️ CONFLICT: Procedure says [procedure claim] but [reference source] \
+   (page N) says [reference claim]. Verify before proceeding.
+4. After each factual claim, cite the source file and page in parentheses.
+5. If the step mentions a numeric value (pressure, torque, temperature, voltage, timing), \
+   always cross-check the retrieved context for the same parameter and flag any discrepancy.
+
+HARD CONSTRAINTS:
+- Every fact must be traceable to the procedure step text or the retrieved context below.
+- Never fabricate values, steps, or specifications.
+- If the retrieved context does not contain what is needed, say exactly: \
+  "That information is not in the ingested documents."
+- If retrieved context contradicts itself, flag all contradictions explicitly.
+
+{figure_note}Retrieved reference documents:
 {context}
 """
 
@@ -459,8 +534,7 @@ async def _retrieve(question: str, col, folder_filter: str | None = None,
             seen.add(key)
             sources.append({"filename": meta["filename"], "page": meta["page"]})
 
-    system = _SYSTEM.format(context="\n\n---\n\n".join(context_parts), figure_note=_FIGURE_NOTE)
-    return system, sources
+    return context_parts, sources
 
 
 def _retrieval_query(question: str, history: list[dict] | None) -> str:
@@ -481,8 +555,25 @@ def _retrieval_query(question: str, history: list[dict] | None) -> str:
     return f"{last_user} {question}"
 
 
+def _build_system(context_parts: list[str], procedure: dict | None) -> str:
+    context = "\n\n---\n\n".join(context_parts)
+    if procedure:
+        steps = procedure["steps"]
+        idx = procedure["step_idx"]
+        return _PROCEDURE_SYSTEM.format(
+            filename=procedure["filename"],
+            step_num=idx + 1,
+            total_steps=len(steps),
+            step_text=steps[idx] if steps else "(no steps found)",
+            figure_note=_FIGURE_NOTE,
+            context=context,
+        )
+    return _SYSTEM.format(context=context, figure_note=_FIGURE_NOTE)
+
+
 async def answer(question: str, history: list[dict] | None = None,
-                 folder_filter: str | None = None, current_user: dict | None = None) -> dict:
+                 folder_filter: str | None = None, current_user: dict | None = None,
+                 procedure: dict | None = None) -> dict:
     col = ingest._db()
     if col.count() == 0:
         return {"answer": _NOT_FOUND, "sources": []}
@@ -490,13 +581,15 @@ async def answer(question: str, history: list[dict] | None = None,
                              folder_filter=folder_filter, current_user=current_user)
     if result is None:
         return {"answer": _NOT_FOUND, "sources": []}
-    system, sources = result
-    reply = await llm.chat(system=system, user=question, history=history)
+    context_parts, sources = result
+    reply = await llm.chat(system=_build_system(context_parts, procedure),
+                           user=question, history=history)
     return {"answer": reply, "sources": sources}
 
 
 async def answer_stream(question: str, history: list[dict] | None = None,
-                        folder_filter: str | None = None, current_user: dict | None = None):
+                        folder_filter: str | None = None, current_user: dict | None = None,
+                        procedure: dict | None = None):
     """Async generator: yields {token} dicts then a final {sources, done} dict."""
     col = ingest._db()
     if col.count() == 0:
@@ -509,7 +602,8 @@ async def answer_stream(question: str, history: list[dict] | None = None,
         yield {"token": _NOT_FOUND}
         yield {"sources": [], "done": True}
         return
-    system, sources = result
-    async for token in llm.chat_stream(system=system, user=question, history=history):
+    context_parts, sources = result
+    async for token in llm.chat_stream(system=_build_system(context_parts, procedure),
+                                       user=question, history=history):
         yield {"token": token}
     yield {"sources": sources, "done": True}

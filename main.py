@@ -322,6 +322,9 @@ _MAX_HISTORY_TURNS = 3           # last 3 user+assistant pairs
 _MAX_HISTORY_MSGS = _MAX_HISTORY_TURNS * 2
 _MAX_SESSIONS = 200              # evict oldest when exceeded
 
+# Procedure mode: keyed by session_id, stores {doc_id, filename, steps, step_idx}
+_proc_sessions: dict[str, dict] = {}
+
 
 def _get_history(session_id: str | None) -> list[dict]:
     if not session_id:
@@ -356,17 +359,28 @@ class RestoreRequest(BaseModel):
     messages: list[dict]
 
 
+class ProcedureStartRequest(BaseModel):
+    doc_id: str
+
+
+class ProcedureNavigateRequest(BaseModel):
+    direction: str = "next"   # "next" or "prev"
+    step: int | None = None   # 0-based index for direct jump
+
+
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest, current_user: dict | None = Depends(get_current_user)):
     if not req.question.strip():
         raise HTTPException(400, "Question is empty")
     history = _get_history(req.session_id)
+    proc = _proc_sessions.get(req.session_id) if req.session_id else None
 
     async def generate():
         tokens: list[str] = []
         async for chunk in retriever.answer_stream(req.question, history=history,
                                                    folder_filter=req.folder_filter,
-                                                   current_user=current_user):
+                                                   current_user=current_user,
+                                                   procedure=proc):
             if "token" in chunk:
                 tokens.append(chunk["token"])
             yield f"data: {json.dumps(chunk)}\n\n"
@@ -387,6 +401,67 @@ async def restore_session(session_id: str, req: RestoreRequest,
 async def clear_session(session_id: str, _: dict | None = Depends(get_current_user)):
     _sessions.pop(session_id, None)
     return {"cleared": session_id}
+
+
+# ── procedure mode ────────────────────────────────────────────────────────────
+
+@app.post("/procedure/session/{session_id}/start")
+async def procedure_start(session_id: str, req: ProcedureStartRequest,
+                          _: dict | None = Depends(get_current_user)):
+    col = ingest._db()
+    result = col.get(where={"doc_id": req.doc_id}, include=["documents", "metadatas"])
+    if not result["ids"]:
+        raise HTTPException(404, "Document not found")
+    filename = result["metadatas"][0]["filename"]
+    # Sort by page then chunk_index; exclude image/summary chunks (chunk_index < 0)
+    paired = sorted(
+        zip(result["ids"], result["documents"], result["metadatas"]),
+        key=lambda x: (x[2]["page"], x[2].get("chunk_index", 0)),
+    )
+    chunks = [
+        doc for _, doc, meta in paired
+        if meta.get("chunk_index", 0) >= 0 and meta.get("chunk_type", "") != "image"
+    ]
+    steps = await retriever._generate_procedure_steps(chunks)
+    _proc_sessions[session_id] = {
+        "doc_id": req.doc_id,
+        "filename": filename,
+        "steps": steps,
+        "step_idx": 0,
+    }
+    return {
+        "filename": filename,
+        "step_num": 1,
+        "total_steps": len(steps),
+        "step_text": steps[0] if steps else "",
+    }
+
+
+@app.post("/procedure/session/{session_id}/navigate")
+async def procedure_navigate(session_id: str, req: ProcedureNavigateRequest,
+                             _: dict | None = Depends(get_current_user)):
+    proc = _proc_sessions.get(session_id)
+    if not proc:
+        raise HTTPException(404, "No active procedure for this session")
+    n = len(proc["steps"])
+    if req.step is not None:
+        idx = max(0, min(req.step, n - 1))
+    elif req.direction == "prev":
+        idx = max(proc["step_idx"] - 1, 0)
+    else:
+        idx = min(proc["step_idx"] + 1, n - 1)
+    proc["step_idx"] = idx
+    return {
+        "step_num": idx + 1,
+        "total_steps": n,
+        "step_text": proc["steps"][idx],
+    }
+
+
+@app.delete("/procedure/session/{session_id}")
+async def procedure_end(session_id: str, _: dict | None = Depends(get_current_user)):
+    _proc_sessions.pop(session_id, None)
+    return {"ended": session_id}
 
 
 if __name__ == "__main__":

@@ -621,6 +621,84 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); }
 }
 #send-btn:hover:not(:disabled) { background: var(--accent-hover); transform: scale(1.06); }
 #send-btn:disabled { opacity: .35; cursor: not-allowed; transform: none; }
+
+/* ── procedure mode ── */
+#proc-bar {
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 20px 12px;
+  background: linear-gradient(135deg, rgba(14,165,233,.07), rgba(2,132,199,.04));
+  border-bottom: 1px solid rgba(14,165,233,.18);
+  flex-shrink: 0;
+}
+#proc-bar.active { display: flex; }
+#proc-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+#proc-title {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#proc-step-counter {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.proc-btn {
+  padding: 4px 11px;
+  font-size: 12px;
+  border-radius: 7px;
+  border: 1px solid rgba(14,165,233,.28);
+  background: rgba(14,165,233,.09);
+  color: var(--accent);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .12s;
+}
+.proc-btn:hover:not(:disabled) { background: rgba(14,165,233,.18); }
+.proc-btn:disabled { opacity: .38; cursor: default; }
+.proc-btn.danger {
+  border-color: rgba(239,68,68,.28);
+  background: rgba(239,68,68,.07);
+  color: var(--danger);
+}
+.proc-btn.danger:hover { background: rgba(239,68,68,.16); }
+#proc-step-box {
+  background: var(--surface);
+  border: 1px solid rgba(14,165,233,.14);
+  border-radius: 9px;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.6;
+  max-height: 130px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}
+#proc-step-box::-webkit-scrollbar { width: 3px; }
+#proc-step-box::-webkit-scrollbar-thumb { background: rgba(14,165,233,.2); border-radius: 99px; }
+
+.doc-proc {
+  width: 18px; height: 18px;
+  border: none; background: none;
+  color: rgba(14,165,233,.5);
+  cursor: pointer; font-size: 10px;
+  border-radius: 3px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity .1s, color .1s;
+}
+.doc-item:hover .doc-proc { opacity: 1; }
+.doc-proc:hover { color: var(--accent); background: rgba(14,165,233,.1); }
 </style>
 </head>
 <body>
@@ -714,6 +792,16 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); }
   </nav>
 
   <div id="main">
+    <div id="proc-bar">
+      <div id="proc-nav">
+        <span id="proc-title">📋 Procedure</span>
+        <span id="proc-step-counter">Step 1 of 1</span>
+        <button class="proc-btn" id="proc-prev-btn" onclick="navigateStep('prev')" disabled>◀ Prev</button>
+        <button class="proc-btn" id="proc-next-btn" onclick="navigateStep('next')">Next ▶</button>
+        <button class="proc-btn danger" onclick="endProcedure()">✕ Exit</button>
+      </div>
+      <div id="proc-step-box"></div>
+    </div>
     <div id="messages">
       <div class="empty-state">
         <img class="es-logo" src="/static/geocosmos_icon.png" alt="GeoCosmos">
@@ -1057,6 +1145,7 @@ async function loadDocs() {
           <span class="doc-icon">${icon}</span>
           <span class="doc-name" title="${safeName}">${safeName}</span>
           <span class="doc-chunks">${d.chunks}</span>
+          <button class="doc-proc" title="Start procedure walkthrough" onclick="startProcedure('${safeId}')">▶</button>
           <button class="doc-move" title="Move to folder" onclick="moveDoc('${safeId}','${escHtml(folderName)}',this)">📁</button>
           <button class="doc-del" title="Remove" onclick="deleteDoc('${safeId}',this)">×</button>
         </div>`;
@@ -1133,6 +1222,77 @@ async function moveDoc(docId, currentFolder, btn) {
 }
 
 loadDocs();
+
+// ── procedure mode ────────────────────────────────────────────────────────────
+let _procState = null; // {docId, filename, stepNum, totalSteps, stepText}
+
+async function startProcedure(docId) {
+  // Find and disable the clicked button while generating
+  const btn = document.querySelector(`.doc-item[data-id="${docId}"] .doc-proc`);
+  if (btn) { btn.textContent = '⏳'; btn.disabled = true; }
+  try {
+    const resp = await _apiFetch(`${API}/procedure/session/${_currentConvId}/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ doc_id: docId }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      showToast(`Procedure error: ${err.detail || resp.status}`, true);
+      return;
+    }
+    const data = await resp.json();
+    _procState = {
+      docId,
+      filename: data.filename,
+      stepNum: data.step_num,
+      totalSteps: data.total_steps,
+      stepText: data.step_text,
+    };
+    updateProcBar();
+  } catch (e) {
+    showToast(`Procedure error: ${e.message}`, true);
+  } finally {
+    if (btn) { btn.textContent = '▶'; btn.disabled = false; }
+  }
+}
+
+async function navigateStep(direction) {
+  if (!_procState) return;
+  const resp = await _apiFetch(`${API}/procedure/session/${_currentConvId}/navigate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ direction }),
+  });
+  if (!resp.ok) return;
+  const data = await resp.json();
+  _procState.stepNum = data.step_num;
+  _procState.totalSteps = data.total_steps;
+  _procState.stepText = data.step_text;
+  updateProcBar();
+}
+
+async function endProcedure() {
+  if (!_procState) return;
+  await _apiFetch(`${API}/procedure/session/${_currentConvId}`, { method: 'DELETE' }).catch(() => {});
+  _procState = null;
+  updateProcBar();
+}
+
+function updateProcBar() {
+  const procBar = document.getElementById('proc-bar');
+  if (!_procState) {
+    procBar.classList.remove('active');
+    return;
+  }
+  procBar.classList.add('active');
+  document.getElementById('proc-title').textContent = `📋 ${_procState.filename}`;
+  document.getElementById('proc-step-counter').textContent =
+    `Step ${_procState.stepNum} of ${_procState.totalSteps}`;
+  document.getElementById('proc-step-box').textContent = _procState.stepText;
+  document.getElementById('proc-prev-btn').disabled = _procState.stepNum <= 1;
+  document.getElementById('proc-next-btn').disabled = _procState.stepNum >= _procState.totalSteps;
+}
 
 // ── upload ────────────────────────────────────────────────────────────────────
 const zone  = document.getElementById('upload-zone');
@@ -1293,7 +1453,12 @@ function saveCurrentConv() {
 
 function newConversation() {
   saveCurrentConv();
-  if (_currentConvId) _apiFetch(`${API}/chat/session/${_currentConvId}`, { method: 'DELETE' }).catch(() => {});
+  if (_currentConvId) {
+    _apiFetch(`${API}/chat/session/${_currentConvId}`, { method: 'DELETE' }).catch(() => {});
+    if (_procState) _apiFetch(`${API}/procedure/session/${_currentConvId}`, { method: 'DELETE' }).catch(() => {});
+  }
+  _procState = null;
+  updateProcBar();
   _currentConvId   = 'sess_' + Math.random().toString(36).slice(2);
   _currentMessages = [];
   chatStarted      = false;
@@ -1304,6 +1469,8 @@ function newConversation() {
 function switchConv(id) {
   if (id === _currentConvId) return;
   saveCurrentConv();
+  _procState = null;
+  updateProcBar();
   const conv = _convs.find(c => c.id === id);
   if (!conv) return;
   _currentConvId   = id;

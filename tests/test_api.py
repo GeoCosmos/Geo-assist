@@ -127,7 +127,7 @@ def test_chat_no_docs(mock_ollama):
 def test_chat_returns_answer_and_sources(mock_ollama):
     client.post("/ingest", files={"file": ("t.txt", b"Cumulative GPA: 3.78", "text/plain")})
 
-    async def fake_stream(question, history=None, folder_filter=None, current_user=None):
+    async def fake_stream(question, history=None, folder_filter=None, current_user=None, procedure=None):
         yield {"token": "The GPA is 3.78"}
         yield {"sources": [{"filename": "t.txt", "page": 1}], "done": True}
 
@@ -212,3 +212,84 @@ def test_ingest_status_shape(mock_ollama):
     assert "prepared" in body
     assert "results" in body
     assert "errors" in body
+
+
+# ── procedure endpoints ───────────────────────────────────────────────────────
+
+def test_procedure_start_unknown_doc():
+    r = client.post("/procedure/session/sess_x/start", json={"doc_id": "doesnotexist"})
+    assert r.status_code == 404
+
+
+def test_procedure_start_and_navigate(mock_ollama):
+    """Upload a doc, start a procedure session, navigate forward and back."""
+    doc_text = b"Valve maintenance specification. Nominal pressure 25 bar."
+    ri = client.post("/ingest", files={"file": ("proc.txt", doc_text, "text/plain")})
+    assert ri.status_code == 200
+    doc_id = ri.json()["doc_id"]
+
+    async def fake_gen(chunks):
+        return ["1. Open the valve", "2. Record the reading", "3. Close the valve"]
+
+    with patch("retriever._generate_procedure_steps", side_effect=fake_gen):
+        r = client.post("/procedure/session/sess_proc/start", json={"doc_id": doc_id})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["filename"] == "proc.txt"
+    assert body["step_num"] == 1
+    assert body["total_steps"] == 3
+    assert body["step_text"] == "1. Open the valve"
+
+    r2 = client.post("/procedure/session/sess_proc/navigate", json={"direction": "next"})
+    assert r2.status_code == 200
+    assert r2.json()["step_num"] == 2
+
+    r3 = client.post("/procedure/session/sess_proc/navigate", json={"direction": "prev"})
+    assert r3.status_code == 200
+    assert r3.json()["step_num"] == 1
+
+
+def test_procedure_navigate_unknown_session():
+    r = client.post("/procedure/session/sess_none/navigate", json={"direction": "next"})
+    assert r.status_code == 404
+
+
+def test_procedure_end(mock_ollama):
+    """DELETE clears the procedure session; subsequent navigate returns 404."""
+    doc_text = b"Valve specification document."
+    ri = client.post("/ingest", files={"file": ("p2.txt", doc_text, "text/plain")})
+    doc_id = ri.json()["doc_id"]
+
+    async def fake_gen(chunks):
+        return ["1. Step one", "2. Step two"]
+
+    with patch("retriever._generate_procedure_steps", side_effect=fake_gen):
+        client.post("/procedure/session/sess_end/start", json={"doc_id": doc_id})
+
+    r = client.delete("/procedure/session/sess_end")
+    assert r.status_code == 200
+
+    r2 = client.post("/procedure/session/sess_end/navigate", json={"direction": "next"})
+    assert r2.status_code == 404
+
+
+def test_procedure_navigate_clamps_to_bounds(mock_ollama):
+    """Navigating past the first/last step stays clamped; no error."""
+    doc_text = b"Single step specification."
+    ri = client.post("/ingest", files={"file": ("single.txt", doc_text, "text/plain")})
+    doc_id = ri.json()["doc_id"]
+
+    async def fake_gen(chunks):
+        return ["1. Only step"]
+
+    with patch("retriever._generate_procedure_steps", side_effect=fake_gen):
+        client.post("/procedure/session/sess_clamp/start", json={"doc_id": doc_id})
+
+    r_prev = client.post("/procedure/session/sess_clamp/navigate", json={"direction": "prev"})
+    assert r_prev.status_code == 200
+    assert r_prev.json()["step_num"] == 1
+
+    r_next = client.post("/procedure/session/sess_clamp/navigate", json={"direction": "next"})
+    assert r_next.status_code == 200
+    assert r_next.json()["step_num"] == r_next.json()["total_steps"]
