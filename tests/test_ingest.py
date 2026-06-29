@@ -132,6 +132,83 @@ def test_extract_pptx_grouped_shapes():
     assert "Callout inside group" in pages[0][1]
 
 
+def test_extract_docx_heading_prepended_to_content():
+    """Each content paragraph carries its section heading so chunks don't lose context."""
+    from unittest.mock import MagicMock, patch
+
+    def make_para(text, style_name):
+        p = MagicMock()
+        p.text = text
+        p.style.name = style_name
+        return p
+
+    mock_doc = MagicMock()
+    mock_doc.paragraphs = [
+        make_para("Revision History", "Heading 1"),
+        make_para("Rev 3.1 — updated thrust specs", "Normal"),
+        make_para("Rev 3.0 — initial release", "Normal"),
+    ]
+    mock_doc.tables = []
+
+    with patch("docx.Document", return_value=mock_doc):
+        pages = ingest._extract_docx(b"fake")
+
+    text = pages[0][1]
+    for part in text.split("\n\n"):
+        if "Rev 3." in part:
+            assert "Revision History" in part, f"Content chunk is missing its section heading: {part!r}"
+
+
+def test_extract_docx_content_before_first_heading_preserved():
+    """Paragraphs appearing before any heading are not dropped."""
+    from unittest.mock import MagicMock, patch
+
+    def make_para(text, style_name):
+        p = MagicMock()
+        p.text = text
+        p.style.name = style_name
+        return p
+
+    mock_doc = MagicMock()
+    mock_doc.paragraphs = [
+        make_para("Preamble text with no heading yet.", "Normal"),
+        make_para("Section A", "Heading 1"),
+        make_para("Section A content.", "Normal"),
+    ]
+    mock_doc.tables = []
+
+    with patch("docx.Document", return_value=mock_doc):
+        pages = ingest._extract_docx(b"fake")
+
+    text = pages[0][1]
+    assert "Preamble text" in text
+    assert "Section A content" in text
+
+
+def test_extract_docx_trailing_heading_preserved():
+    """A heading with no content beneath it must still appear in the output."""
+    from unittest.mock import MagicMock, patch
+
+    def make_para(text, style_name):
+        p = MagicMock()
+        p.text = text
+        p.style.name = style_name
+        return p
+
+    mock_doc = MagicMock()
+    mock_doc.paragraphs = [
+        make_para("Section A", "Heading 1"),
+        make_para("Content here.", "Normal"),
+        make_para("Section B", "Heading 1"),  # no content follows
+    ]
+    mock_doc.tables = []
+
+    with patch("docx.Document", return_value=mock_doc):
+        pages = ingest._extract_docx(b"fake")
+
+    assert "Section B" in pages[0][1]
+
+
 def test_extract_unsupported_falls_back_to_text():
     pages = ingest.extract_pages(b"some content", "file.log")
     assert len(pages) == 1

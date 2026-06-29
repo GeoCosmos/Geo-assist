@@ -63,32 +63,93 @@ def _table_to_markdown(table) -> str:
     return "\n".join(md)
 
 
+def _pdf_body_font_size(page_dict: dict) -> float:
+    """Return the median font size on a page — used as the body text baseline."""
+    sizes = [
+        span["size"]
+        for block in page_dict.get("blocks", [])
+        if block.get("type") == 0
+        for line in block.get("lines", [])
+        for span in line.get("spans", [])
+        if span["text"].strip()
+    ]
+    if not sizes:
+        return 10.0
+    sizes.sort()
+    return sizes[len(sizes) // 2]
+
+
+def _is_heading_block(block: dict, heading_min_size: float) -> bool:
+    """True when a dict-mode block looks like a section heading."""
+    spans = [
+        s for line in block.get("lines", [])
+        for s in line.get("spans", [])
+        if s["text"].strip()
+    ]
+    if not spans:
+        return False
+    full_text = "".join(s["text"] for s in spans).strip()
+    if not full_text or len(full_text) > 150:
+        return False
+    avg_size = sum(s["size"] for s in spans) / len(spans)
+    if avg_size >= heading_min_size:
+        return True
+    # Bold + short = heading even at body size (e.g. "Rev History" in same-size bold)
+    return len(full_text) <= 80 and all(
+        "Bold" in s.get("font", "") or "bold" in s.get("font", "") for s in spans
+    )
+
+
 def _extract_pdf(data: bytes) -> list[tuple[int, str]]:
     import fitz
     doc = fitz.open(stream=data, filetype="pdf")
     pages = []
     for i, page in enumerate(doc):
         tables = page.find_tables()
-        if not tables.tables:
-            pages.append((i + 1, page.get_text()))
-            continue
+        table_rects = [fitz.Rect(t.bbox) for t in tables.tables] if tables.tables else []
 
-        # Interleave non-table text and markdown tables in reading order (sorted by y0)
-        # so chunks span content that is actually adjacent in the document.
-        table_rects = [fitz.Rect(t.bbox) for t in tables.tables]
-        content: list[tuple[float, str]] = []
-        for block in page.get_text("blocks"):
-            if block[6] != 0:  # skip image blocks
+        page_dict = page.get_text("dict")
+        body_size = _pdf_body_font_size(page_dict)
+        heading_min = body_size * 1.15
+
+        # (y0, text, is_heading) — interleave text blocks and table markdown in reading order
+        content: list[tuple[float, str, bool]] = []
+        for block in page_dict.get("blocks", []):
+            if block.get("type") != 0:
                 continue
-            if not any(fitz.Rect(block[:4]).intersects(tr) for tr in table_rects):
-                content.append((block[1], block[4]))  # (y0, text)
+            block_rect = fitz.Rect(block["bbox"])
+            if table_rects and any(block_rect.intersects(tr) for tr in table_rects):
+                continue
+            lines_text = [
+                "".join(s["text"] for s in line.get("spans", []))
+                for line in block.get("lines", [])
+            ]
+            block_text = "\n".join(t for t in lines_text if t.strip())
+            if not block_text.strip():
+                continue
+            content.append((block["bbox"][1], block_text, _is_heading_block(block, heading_min)))
+
         for table_idx, t in enumerate(tables.tables):
             md = _table_to_markdown(t)
             if md:
-                content.append((t.bbox[1], f"Table {table_idx}\n{md}"))  # (y0, markdown table)
+                content.append((t.bbox[1], f"Table {table_idx}\n{md}", False))
+
         content.sort(key=lambda x: x[0])
-        page_text = "\n\n".join(text for _, text in content)
-        pages.append((i + 1, page_text))
+
+        current_heading: str | None = None
+        parts: list[str] = []
+        for _, text, is_heading in content:
+            stripped = text.strip()
+            if not stripped:
+                continue
+            if is_heading:
+                current_heading = stripped
+            else:
+                parts.append(f"{current_heading}\n{stripped}" if current_heading else stripped)
+        if not parts and current_heading:
+            parts.append(current_heading)
+
+        pages.append((i + 1, "\n\n".join(parts)))
 
     return pages
 
@@ -96,7 +157,19 @@ def _extract_pdf(data: bytes) -> list[tuple[int, str]]:
 def _extract_docx(data: bytes) -> list[tuple[int, str]]:
     from docx import Document
     doc = Document(io.BytesIO(data))
-    parts = [p.text for p in doc.paragraphs if p.text.strip()]
+    current_heading: str | None = None
+    paras: list[str] = []
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+        if para.style.name.startswith("Heading"):
+            current_heading = text
+        else:
+            paras.append(f"{current_heading}\n{text}" if current_heading else text)
+    # Flush a trailing heading that had no content under it
+    if current_heading and (not paras or not paras[-1].startswith(current_heading)):
+        paras.append(current_heading)
     for table in doc.tables:
         rows = []
         for i, row in enumerate(table.rows):
@@ -105,8 +178,8 @@ def _extract_docx(data: bytes) -> list[tuple[int, str]]:
             if i == 0:
                 rows.append("| " + " | ".join(["---"] * len(cells)) + " |")
         if rows:
-            parts.append("\n".join(rows))
-    return [(1, "\n".join(parts))]
+            paras.append("\n".join(rows))
+    return [(1, "\n\n".join(paras))]
 
 
 def _pptx_shape_texts(shape) -> list[str]:
