@@ -624,14 +624,19 @@ def test_table_to_markdown_single_row():
 
 
 def test_extract_pdf_no_tables_uses_plain_text():
-    """When find_tables returns no tables, plain page.get_text() should be used."""
+    """When find_tables returns no tables, page text is extracted via get_text('dict')."""
 
     mock_table_finder = MagicMock()
     mock_table_finder.tables = []
 
     mock_page = MagicMock()
     mock_page.find_tables.return_value = mock_table_finder
-    mock_page.get_text.return_value = "Plain page text content."
+    mock_page.get_text.return_value = {
+        "blocks": [{
+            "type": 0, "bbox": [0, 0, 400, 50],
+            "lines": [{"spans": [{"text": "Plain page text content.", "size": 12.0, "font": "Arial"}]}],
+        }]
+    }
 
     mock_doc = MagicMock()
     mock_doc.__iter__ = MagicMock(return_value=iter([mock_page]))
@@ -640,8 +645,8 @@ def test_extract_pdf_no_tables_uses_plain_text():
     with patch("fitz.open", return_value=mock_doc):
         pages = ingest._extract_pdf(b"fake pdf")
 
-    assert pages[0][1] == "Plain page text content."
-    mock_page.get_text.assert_called_once()
+    assert "Plain page text content." in pages[0][1]
+    mock_page.get_text.assert_called_once_with("dict")
 
 
 def test_extract_pdf_with_tables_converts_to_markdown():
@@ -658,9 +663,11 @@ def test_extract_pdf_with_tables_converts_to_markdown():
     mock_page.find_tables.return_value = mock_table_finder
     mock_page.get_text.return_value = "Header text above table."
 
-    mock_block = (0, 0, 400, 50, "Header text above table.", 0, 0)
     mock_page.get_text.side_effect = lambda mode=None, **kw: (
-        [mock_block] if mode == "blocks" else "Header text above table."
+        {"blocks": [{"type": 0, "bbox": [0, 0, 400, 50],
+                     "lines": [{"spans": [{"text": "Header text above table.",
+                                           "size": 12.0, "font": "Arial"}]}]}]}
+        if mode == "dict" else "Header text above table."
     )
 
     mock_doc = MagicMock()
@@ -1460,13 +1467,15 @@ def test_extract_pdf_table_interleaved_in_reading_order():
     mock_table_finder = MagicMock()
     mock_table_finder.tables = [mock_table]
 
-    block_top    = (0,  20, 400,  80, "Top paragraph.",    0, 0)
-    block_bottom = (0, 220, 400, 280, "Bottom paragraph.", 0, 0)
-
     mock_page = MagicMock()
     mock_page.find_tables.return_value = mock_table_finder
     mock_page.get_text.side_effect = lambda mode=None, **kw: (
-        [block_top, block_bottom] if mode == "blocks" else "fallback"
+        {"blocks": [
+            {"type": 0, "bbox": [0, 20, 400, 80],
+             "lines": [{"spans": [{"text": "Top paragraph.", "size": 12.0, "font": "Arial"}]}]},
+            {"type": 0, "bbox": [0, 220, 400, 280],
+             "lines": [{"spans": [{"text": "Bottom paragraph.", "size": 12.0, "font": "Arial"}]}]},
+        ]} if mode == "dict" else "fallback"
     )
 
     mock_doc = MagicMock()
@@ -1504,7 +1513,7 @@ def test_extract_pdf_table_has_marker_label():
     mock_page = MagicMock()
     mock_page.find_tables.return_value = mock_table_finder
     mock_page.get_text.side_effect = lambda mode=None, **kw: (
-        [] if mode == "blocks" else "fallback"
+        {"blocks": []} if mode == "dict" else "fallback"
     )
 
     mock_doc = MagicMock()
@@ -1534,7 +1543,7 @@ def test_extract_pdf_table_marker_enables_table_id():
     mock_page = MagicMock()
     mock_page.find_tables.return_value = mock_table_finder
     mock_page.get_text.side_effect = lambda mode=None, **kw: (
-        [] if mode == "blocks" else "fallback"
+        {"blocks": []} if mode == "dict" else "fallback"
     )
 
     mock_doc = MagicMock()

@@ -19,6 +19,17 @@ _COMPARISON_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Queries that ask for a cross-document table / inventory of all files.
+# Normal RRF (k=8, max_per_file=2) can only surface 4 files at once — catalog
+# mode bypasses that cap and fetches one representative chunk per document.
+_CATALOG_RE = re.compile(
+    r'(?:table|list|overview|summary)\s+of\s+(?:all\s+)?(?:files?|documents?)|'
+    r'\b(?:all|each|every)\s+(?:files?|documents?)\b|'
+    r'\bfile\s*names?\s*(?:and|with|,)|'
+    r'\b(?:all|each|every|list)\b.{0,40}\brevision\b',
+    re.IGNORECASE,
+)
+
 log = logging.getLogger(__name__)
 
 _RRF_K = 60
@@ -416,11 +427,75 @@ def _with_access(where: dict | None, current_user: dict | None) -> dict | None:
     return {"$and": [where, access_clause]}
 
 
+def _catalog_context(
+    question: str,
+    col,
+    folder_filter: str | None,
+    current_user: dict | None,
+) -> tuple[list[str], list[dict]] | None:
+    """Catalog/inventory mode: one representative chunk per ingested document.
+
+    Normal RRF caps at k=8 chunks total (max 2 per file), so cross-document
+    table queries only ever see 4 files. This function bypasses that by fetching
+    the highest BM25-scoring chunk from every document, plus its summary chunk
+    when one exists. Capped at 20 documents to keep context manageable.
+    """
+    docs = ingest.list_documents()
+    if folder_filter:
+        docs = [d for d in docs if d.get("folder") == folder_filter]
+    if not docs:
+        return None
+
+    bm25_scores = {cid: score for cid, score in bm25_index.search(question)}
+    context_parts: list[str] = []
+    sources: list[dict] = []
+    seen: set = set()
+
+    for doc in docs[:20]:
+        doc_id = doc["doc_id"]
+        where = _with_access(_with_folder({"doc_id": doc_id}, folder_filter), current_user)
+        fetched = col.get(where=where, include=["documents", "metadatas"])
+        if not fetched["ids"]:
+            continue
+
+        # Exclude image chunks — they don't carry metadata fields like revision numbers
+        text_chunks = [
+            (cid, text, meta)
+            for cid, text, meta in zip(fetched["ids"], fetched["documents"], fetched["metadatas"])
+            if meta.get("chunk_type") != "image" and text and text.strip()
+        ]
+        if not text_chunks:
+            continue
+
+        summary = next(((c, t, m) for c, t, m in text_chunks if c.endswith("_1_-1")), None)
+        best = max(text_chunks, key=lambda x: bm25_scores.get(x[0], 0.0))
+
+        chosen = []
+        if summary and summary[0] != best[0]:
+            chosen.append(summary)
+        chosen.append(best)
+
+        for _, text, meta in chosen:
+            context_parts.append(f"[{meta['filename']}, page {meta['page']}]\n{text}")
+            key = (meta["doc_id"], meta["page"])
+            if key not in seen:
+                seen.add(key)
+                sources.append({"filename": meta["filename"], "page": meta["page"]})
+
+    return (context_parts, sources) if context_parts else None
+
+
 async def _retrieve(question: str, col, folder_filter: str | None = None,
                     current_user: dict | None = None) -> tuple[str, list] | None:
     """Run the full retrieval pipeline. Returns (system_prompt, sources) or None."""
     if bm25_index.size() == 0:
         bm25_index.load_or_rebuild(col)
+
+    if _CATALOG_RE.search(question):
+        result = _catalog_context(question, col, folder_filter, current_user)
+        if result:
+            log.info("catalog mode: returning one chunk per document (%d docs)", len(result[1]))
+            return result
 
     sem_where = _with_access(_with_folder(None, folder_filter), current_user)
 
