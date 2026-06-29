@@ -433,12 +433,14 @@ def _catalog_context(
     folder_filter: str | None,
     current_user: dict | None,
 ) -> tuple[list[str], list[dict]] | None:
-    """Catalog/inventory mode: one representative chunk per ingested document.
+    """Catalog/inventory mode: first page chunks from every ingested document.
 
-    Normal RRF caps at k=8 chunks total (max 2 per file), so cross-document
-    table queries only ever see 4 files. This function bypasses that by fetching
-    the highest BM25-scoring chunk from every document, plus its summary chunk
-    when one exists. Capped at 20 documents to keep context manageable.
+    For structured documents (SOPs, specs, manuals) the header block — document
+    number, revision, date, author — always lives on page 1. Fetching by position
+    (first 3 chunks of page 1) is more reliable than BM25 scoring, which drifts
+    toward wherever the query term appears most frequently in the body.
+
+    Capped at 15 documents to keep context within a range the LLM can synthesise.
     """
     docs = ingest.list_documents()
     if folder_filter:
@@ -446,19 +448,17 @@ def _catalog_context(
     if not docs:
         return None
 
-    bm25_scores = {cid: score for cid, score in bm25_index.search(question)}
     context_parts: list[str] = []
     sources: list[dict] = []
     seen: set = set()
 
-    for doc in docs[:20]:
+    for doc in docs[:15]:
         doc_id = doc["doc_id"]
         where = _with_access(_with_folder({"doc_id": doc_id}, folder_filter), current_user)
         fetched = col.get(where=where, include=["documents", "metadatas"])
         if not fetched["ids"]:
             continue
 
-        # Exclude image chunks — they don't carry metadata fields like revision numbers
         text_chunks = [
             (cid, text, meta)
             for cid, text, meta in zip(fetched["ids"], fetched["documents"], fetched["metadatas"])
@@ -467,13 +467,13 @@ def _catalog_context(
         if not text_chunks:
             continue
 
-        summary = next(((c, t, m) for c, t, m in text_chunks if c.endswith("_1_-1")), None)
-        best = max(text_chunks, key=lambda x: bm25_scores.get(x[0], 0.0))
-
-        chosen = []
-        if summary and summary[0] != best[0]:
-            chosen.append(summary)
-        chosen.append(best)
+        # First 3 chunks from page 1, sorted by chunk_index — the document header
+        # (revision, doc number, date) is always in this region for SOPs and specs.
+        page1 = sorted(
+            [c for c in text_chunks if c[2]["page"] == 1 and c[2].get("chunk_index", 0) >= 0],
+            key=lambda x: x[2].get("chunk_index", 0),
+        )[:3]
+        chosen = page1 if page1 else text_chunks[:2]
 
         for _, text, meta in chosen:
             context_parts.append(f"[{meta['filename']}, page {meta['page']}]\n{text}")
