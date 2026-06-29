@@ -30,10 +30,17 @@ import config
 log = logging.getLogger(__name__)
 
 _stemmer = SnowballStemmer("english")
+# Match decimal numbers (e.g. "3.7", "59.473") as a single token before falling
+# back to regular word tokens. Without this, "3.7" splits into ["3", "7"] and
+# exact numeric matching in BM25 becomes useless.
+_TOKEN_RE = re.compile(r"\d+\.\d+|\b\w+\b")
 
 
 def _tokenize(text: str) -> list[str]:
-    return [_stemmer.stem(t) for t in re.findall(r"\b\w+\b", text.lower())]
+    return [
+        t if t[0].isdigit() else (_stemmer.stem(t) if t.isascii() else t)
+        for t in _TOKEN_RE.findall(text.lower())
+    ]
 
 
 class BM25Index:
@@ -83,6 +90,31 @@ class BM25Index:
             pairs = ((cid, s) for cid, s in pairs if self._folders.get(cid) == folder)
         return sorted(pairs, key=lambda x: -x[1])
 
+    def search_with_folder(
+        self, query: str, folder: str | None = None
+    ) -> tuple[list[tuple[str, float]], list[tuple[str, float]]]:
+        """Score once; return (all_sorted, folder_filtered_sorted).
+
+        Avoids a second get_scores() call when both the full score map and a
+        folder-filtered top-K are needed in the same request.
+        """
+        if not self._bm25 or not self._ids:
+            return [], []
+        tokens = _tokenize(query)
+        if not tokens:
+            return [], []
+        scores = self._bm25.get_scores(tokens)
+        all_sorted = sorted(zip(self._ids, scores), key=lambda x: -x[1])
+        if folder:
+            filtered = [(cid, s) for cid, s in all_sorted if self._folders.get(cid) == folder]
+        else:
+            filtered = all_sorted
+        return all_sorted, filtered
+
+    def update_folders(self, updates: dict[str, str]) -> None:
+        """Patch folder metadata for specific chunks without a full rebuild."""
+        self._folders.update(updates)
+
     @property
     def size(self) -> int:
         return len(self._ids)
@@ -94,6 +126,16 @@ _index = BM25Index()
 
 def search(query: str, folder: str | None = None) -> list[tuple[str, float]]:
     return _index.search(query, folder=folder)
+
+
+def search_with_folder(
+    query: str, folder: str | None = None
+) -> tuple[list[tuple[str, float]], list[tuple[str, float]]]:
+    return _index.search_with_folder(query, folder=folder)
+
+
+def update_folders(updates: dict[str, str]) -> None:
+    _index.update_folders(updates)
 
 
 def size() -> int:

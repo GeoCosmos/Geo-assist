@@ -9,6 +9,12 @@ EXPAND_MODEL = os.environ.get("GEO_EXPAND_MODEL", CHAT_MODEL)
 # Set to a local vision-capable model (e.g. "llava:7b") to enable image analysis.
 # Leave empty to skip image extraction entirely (safe default for non-vision setups).
 VISION_MODEL = os.environ.get("GEO_VISION_MODEL", "")
+# Set GEO_OCR=true to enable fast easyocr text extraction from images (screenshots,
+# text-heavy figures). Requires: pip install -r requirements-ocr.txt
+# OCR runs first; images yielding fewer than OCR_MIN_WORDS words fall through to
+# VISION_MODEL if set (for diagrams, schematics, wiring).
+OCR_ENABLED   = os.environ.get("GEO_OCR",           "false").lower() == "true"
+OCR_MIN_WORDS = int(os.environ.get("GEO_OCR_MIN_WORDS", "10"))
 
 # Query expansion adds one full LLM round-trip (~20-25s) before retrieval.
 # Disable for lower latency; enable only if cross-doc accuracy needs improving.
@@ -39,6 +45,6 @@ AUTH_ENABLED = os.environ.get("GEO_AUTH", "0") == "1"
 # Cross-encoder re-ranking. Disabled by default — requires sentence-transformers and
 # the model to be pre-downloaded before running in an air-gapped environment.
 # Pre-download: python3 -c "from sentence_transformers import CrossEncoder; CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
-RERANK_ENABLED = os.environ.get("GEO_RERANK", "false").lower() == "true"
+RERANK_ENABLED = os.environ.get("GEO_RERANK", "true").lower() == "true"
 RERANK_MODEL   = os.environ.get("GEO_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 RERANK_TOP_N   = 20  # candidates fed to the cross-encoder before diversity filtering

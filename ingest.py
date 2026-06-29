@@ -17,6 +17,7 @@ import llm
 
 _lock = asyncio.Lock()
 _background_tasks: set = set()
+_PREPARE_CONCURRENCY = 16  # max files parsed+embedded concurrently; bounds peak RAM on large batches
 _chroma_client: chromadb.ClientAPI | None = None
 _chroma: chromadb.Collection | None = None
 _doc_cache: list[dict] | None = None
@@ -170,7 +171,7 @@ def _extract_docx(data: bytes) -> list[tuple[int, str]]:
     # Flush a trailing heading that had no content under it
     if current_heading and (not paras or not paras[-1].startswith(current_heading)):
         paras.append(current_heading)
-    for table in doc.tables:
+    for tbl_idx, table in enumerate(doc.tables):
         rows = []
         for i, row in enumerate(table.rows):
             cells = [cell.text.strip().replace("|", "\\|").replace("\n", " ") for cell in row.cells]
@@ -178,7 +179,9 @@ def _extract_docx(data: bytes) -> list[tuple[int, str]]:
             if i == 0:
                 rows.append("| " + " | ".join(["---"] * len(cells)) + " |")
         if rows:
-            paras.append("\n".join(rows))
+            # "Table N" prefix mirrors PDF extraction so _tag_table_chunks can
+            # detect DOCX tables and assign table_id for completeness injection.
+            paras.append(f"Table {tbl_idx}\n" + "\n".join(rows))
     return [(1, "\n\n".join(paras))]
 
 
@@ -404,7 +407,7 @@ def _extract_images_docx(data: bytes) -> list[tuple[int, int, bytes]]:
 
 def extract_images(data: bytes, filename: str) -> list[tuple[int, int, bytes]]:
     """Return (page_num, img_idx, img_bytes) for each qualifying image in the file."""
-    if not config.VISION_MODEL:
+    if not config.VISION_MODEL and not config.OCR_ENABLED:
         return []
     ext = Path(filename).suffix.lower()
     if ext == ".pdf":
@@ -441,11 +444,22 @@ async def _analyze_images(
 
     async def _one(page_num: int, img_idx: int, img_bytes: bytes):
         try:
-            img_bytes = _preprocess_image(img_bytes)
+            processed = _preprocess_image(img_bytes)
         except Exception:
             log.warning("image preprocessing failed for %s page %d", filename, page_num, exc_info=True)
-        desc = await llm.analyze_image(img_bytes, filename, page_num)
-        return (page_num, img_idx, desc) if desc else None
+            processed = img_bytes
+
+        if config.OCR_ENABLED:
+            loop = asyncio.get_event_loop()
+            ocr_text = await loop.run_in_executor(None, _ocr_image, processed)
+            if ocr_text:
+                return (page_num, img_idx, ocr_text)
+
+        if config.VISION_MODEL:
+            desc = await llm.analyze_image(processed, filename, page_num)
+            return (page_num, img_idx, desc) if desc else None
+
+        return None
 
     results = await asyncio.gather(*[_one(p, i, b) for p, i, b in images])
     return [r for r in results if r is not None]
@@ -454,6 +468,46 @@ async def _analyze_images(
 # Image chunks use negative chunk_index values starting here to avoid colliding
 # with text chunks (≥ 0) and the summary chunk (−1 on page 1).
 _IMAGE_CHUNK_IDX_BASE = -100
+
+_ocr_reader = None
+_ocr_available: bool | None = None  # None = not yet tried; False = permanently unavailable
+
+
+def _get_ocr_reader():
+    global _ocr_reader, _ocr_available
+    if _ocr_available is False:
+        return None
+    if _ocr_reader is not None:
+        return _ocr_reader
+    try:
+        import easyocr
+        _ocr_reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+        _ocr_available = True
+        log.info("OCR reader loaded (easyocr)")
+    except ImportError:
+        _ocr_available = False
+        log.warning(
+            "easyocr not installed — OCR disabled. "
+            "Install with: pip install -r requirements-ocr.txt"
+        )
+    except Exception as exc:
+        _ocr_available = False
+        log.warning("OCR reader unavailable (%s) — OCR disabled", exc)
+    return _ocr_reader
+
+
+def _ocr_image(img_bytes: bytes) -> str | None:
+    """Synchronous OCR via easyocr. Must be called via run_in_executor — blocks the thread."""
+    reader = _get_ocr_reader()
+    if reader is None:
+        return None
+    try:
+        lines = reader.readtext(img_bytes, detail=0, paragraph=True)
+        text = " ".join(lines).strip()
+        return text if len(text.split()) >= config.OCR_MIN_WORDS else None
+    except Exception:
+        log.warning("OCR failed for image", exc_info=True)
+        return None
 
 
 # ── table detection ───────────────────────────────────────────────────────────
@@ -630,6 +684,34 @@ async def _analyze_and_store_images(
     log.info("stored %d image chunk(s) for %s", len(image_chunks), filename)
 
 
+_LLM_SUMMARY_SYSTEM = (
+    "You are a technical document indexer. Write a 2-3 sentence summary covering: "
+    "(1) what this document is and its purpose, (2) the main system or subject, "
+    "(3) any key identifiers such as document number, revision, date, or critical specs. "
+    "Include specific values and numbers where present. "
+    "Output only the summary — no preamble, no labels, no trailing remarks."
+)
+
+
+async def _llm_summary(title: str, first_page_text: str) -> str | None:
+    """Generate a natural-language summary of a document's first page.
+
+    Called only when KV-pattern extraction produces nothing, so non-spec documents
+    (manuals, reports, procedures) still get a summary chunk for cross-doc queries.
+    """
+    if not first_page_text.strip():
+        return None
+    try:
+        result = await llm.chat(
+            system=_LLM_SUMMARY_SYSTEM,
+            user=f"Document: {title}\n\nFirst page:\n{first_page_text[:2000]}",
+        )
+        return result.strip() or None
+    except Exception:
+        log.warning("LLM summary generation failed for %s", title, exc_info=True)
+        return None
+
+
 async def _prepare(data: bytes, filename: str, folder: str = "General",
                    access: str = "public", owner: str = "") -> dict:
     """Parse, chunk, and embed one file. The slow part — safe to run concurrently."""
@@ -642,9 +724,14 @@ async def _prepare(data: bytes, filename: str, folder: str = "General",
     title = _extract_doc_title(pages, filename)
     full_text = "\n".join(text for _, text in pages)
 
-    # Synthetic summary chunk — converts spec table rows to natural language so
-    # factual queries ("What is the mass of X?") hit the right document directly.
+    # Synthetic summary chunk — KV-pattern extraction for spec tables; LLM fallback
+    # for manuals, reports, and procedures where no KV rows are present.
     summary = _summary_chunk(title, full_text)
+    if not summary:
+        first_page_text = pages[0][1] if pages else ""
+        llm_sum = await _llm_summary(title, first_page_text)
+        if llm_sum:
+            summary = f"{title} — {llm_sum}"
     summary_chunk_list = [{"page": 1, "chunk_index": -1, "text": summary}] if summary else []
 
     _tag_table_chunks(doc_id, pages, chunks)
@@ -732,9 +819,13 @@ async def ingest(data: bytes, filename: str, folder: str = "General",
 async def ingest_many(files: list[tuple[bytes, str]], folder: str = "General",
                       access: str = "public", owner: str = "") -> list[dict]:
     """Ingest multiple files with concurrent parse+embed, then one write pass and one BM25 rebuild."""
-    payloads = await asyncio.gather(
-        *[_prepare(data, fn, folder=folder, access=access, owner=owner) for data, fn in files]
-    )
+    sem = asyncio.Semaphore(_PREPARE_CONCURRENCY)
+
+    async def _bounded(data: bytes, fn: str) -> dict:
+        async with sem:
+            return await _prepare(data, fn, folder=folder, access=access, owner=owner)
+
+    payloads = await asyncio.gather(*[_bounded(data, fn) for data, fn in files])
     async with _lock:
         col = _db()
         results = [_write(col, p) for p in payloads]
@@ -751,8 +842,11 @@ async def ingest_many_tracked(files: list[tuple[bytes, str]], job,
     single-threaded — only one coroutine runs at a time, and increments happen
     between awaits, so there are no races.
     """
+    sem = asyncio.Semaphore(_PREPARE_CONCURRENCY)
+
     async def _prepare_and_tick(data: bytes, fn: str) -> dict:
-        result = await _prepare(data, fn, folder=folder, access=access, owner=owner)
+        async with sem:
+            result = await _prepare(data, fn, folder=folder, access=access, owner=owner)
         job.prepared += 1
         return result
 
@@ -803,7 +897,7 @@ def move_document(doc_id: str, new_folder: str) -> int:
     new_metas = [{**m, "folder": new_folder} for m in existing["metadatas"]]
     col.update(ids=existing["ids"], metadatas=new_metas)
     _invalidate_cache()
-    bm25_index.rebuild(col)
+    bm25_index.update_folders({cid: new_folder for cid in existing["ids"]})
     return len(existing["ids"])
 
 

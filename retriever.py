@@ -13,6 +13,21 @@ import reranker
 # standalone acronyms don't match.
 _SYS_REF = re.compile(r'\b([A-Z]+-\d+(?:\s+[A-Z][A-Za-z]*){1,3})\b')
 
+# Queries seeking a specific measured or specified value — triggers BM25 boosting
+# so exact token matching dominates over semantic similarity.
+_VALUE_QUERY_RE = re.compile(
+    r'\b('
+    r'pressure|temperature|voltage|current|power|watt|mass|weight|'
+    r'torque|force|flow|frequency|speed|velocity|thrust|impulse|acceleration|'
+    r'dimension|thickness|diameter|radius|height|width|length|depth|area|volume|'
+    r'resistance|impedance|capacitance|inductance|gain|loss|efficiency|'
+    r'spec(?:ification)?s?|parameter|rating|rated|nominal|'
+    r'maximum|minimum|max\b|min\b|tolerance|limit|threshold|range|margin|'
+    r'measurement|reading|value\s+of|how\s+(?:much|many)'
+    r')\b',
+    re.IGNORECASE,
+)
+
 _COMPARISON_RE = re.compile(
     r'\b(top.perform|best|highest|most efficient|lowest|least massive|'
     r'rank|leader|which .{0,20}(best|highest|top)|among .{0,40}documents?)\b',
@@ -32,55 +47,133 @@ _CATALOG_RE = re.compile(
 
 # ── per-document catalog extraction ───────────────────────────────────────────
 
-# Regex fast-path for common document header fields.
-_FIELD_RES = {
-    "Revision":      re.compile(r'\b(?:rev(?:ision)?\.?\s*(?:no\.?|#)?|version|ver\.?)\s*[:#.]?\s*([A-Z]?\d+(?:[.\-]\d+)*[A-Za-z]?|[A-Z](?:[.\-]\d+)*)\b', re.IGNORECASE),
-    "Document No":   re.compile(r'\b(?:doc(?:ument)?\.?\s*(?:no\.?|num(?:ber)?|#)|ref(?:erence)?\.?\s*(?:no\.?|#)?)\s*[:#.]?\s*([A-Z0-9][A-Z0-9\-/._]{1,40})', re.IGNORECASE),
-    "Date":          re.compile(r'\b(?:date|effective\s+date|issued|approved)\s*[:#.]?\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{4}[/\-]\d{2}[/\-]\d{2}|\w+\.?\s+\d{1,2},?\s+\d{4})', re.IGNORECASE),
-    "Software Ver":  re.compile(r'\b(?:software\s+(?:version|ver\.?|release)|sw\s+(?:version|ver\.?))\s*[:#.]?\s*([A-Z0-9][A-Z0-9\-._]{0,30})', re.IGNORECASE),
-    "Hardware":      re.compile(r'\b(?:hardware\s+(?:version|ver\.?|revision|rev\.?)|hw\s+(?:version|ver\.?))\s*[:#.]?\s*([A-Z0-9][A-Z0-9\-._]{0,30})', re.IGNORECASE),
-}
+_REV_TABLE_HEADER = re.compile(
+    r'\|\s*(?:is\.?\s*rev|ed\.?\s*r[eé]v|revision|rev(?:ision)?\.?\s*no\.?|version)\b',
+    re.IGNORECASE,
+)
+_TABLE_ROW = re.compile(r'^\|\s*([^|]+?)\s*\|')
+_DOCNUM_FROM_FILENAME = re.compile(r'^([A-Za-z]{1,5}\d{2,}[A-Za-z0-9]*|[A-Z]{2}-\d+)', re.IGNORECASE)
+_COPYRIGHT_EDITION = re.compile(r'[©\-]\s*\w[\w\s]+[–\-]\s*(\S+)\s+(\S+)\s*$', re.MULTILINE)
+_DATE_RE = re.compile(
+    r'\b(?:date|issued|approved)\s*[:#.]?\s*'
+    r'(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{4}[/\-]\d{2}[/\-]\d{2}|\w+\.?\s+\d{1,2},?\s+\d{4})',
+    re.IGNORECASE,
+)
+
+
+def _doc_number_from_filename(filename: str) -> str:
+    stem = filename.rsplit(".", 1)[0]
+    m = _DOCNUM_FROM_FILENAME.match(stem)
+    return m.group(1).upper() if m else "—"
+
+
+_CHUNK_TITLE_PREFIX = re.compile(r'^\[[^\]]{1,120}\]\s*')
+_PAGE_HEADER_COMBINED = re.compile(
+    # "Issue 3  Rev 2" / "Ed. 3  Rév. 2" / "Is. 3  Rev. 2" — issue + revision as separate fields
+    r'(?:iss?ue|ed(?:ition)?\.?|éd(?:ition)?\.?)\s*[:\.]?\s*(\d+)\s{0,15}'
+    r'(?:rev(?:ision)?\.?|rév\.?)\s*[:\.]?\s*(\d[\w\.]*)',
+    re.IGNORECASE,
+)
+_PAGE_HEADER_REV = re.compile(
+    # Standalone: must have explicit label + colon/dot to avoid matching section/table numbers
+    r'(?:is\.?\s*rev(?:ision)?|rev(?:ision)?\.?|rév(?:ision)?\.?)\s*[:\.]\s*(\d[\w\.]*)',
+    re.IGNORECASE,
+)
+
+
+def _revision_from_page_headers(text_pairs: list[tuple[str, dict]]) -> str:
+    """Extract revision from running page headers (top of page 2+).
+
+    SAFRAN manuals stamp the current revision on every page header. We look at
+    the first chunk of each page beyond page 1. Try combined Issue+Rev first
+    (e.g. "Issue 3 Rev 2" → "3/2"), then standalone Rev label.
+    """
+    pages_seen: set[int] = set()
+    for text, meta in text_pairs:
+        page = meta.get("page", 1)
+        if page <= 1 or page in pages_seen:
+            continue
+        pages_seen.add(page)
+        top = "\n".join(text.splitlines()[:10])
+        m = _PAGE_HEADER_COMBINED.search(top)
+        if m:
+            return f"{m.group(1)}/{m.group(2).strip()}"
+        m = _PAGE_HEADER_REV.search(top)
+        if m:
+            return m.group(1).strip()
+    return "—"
+
+
+def _latest_revision_from_chunks(chunks: list[str]) -> str:
+    """Scan all page-1 chunk text for a revision history table and return the
+    last non-empty revision value.
+
+    Each chunk stored in ChromaDB starts with a [filename] prefix line. That
+    non-pipe line would normally reset in_rev_table=False mid-table when the
+    same table spans multiple chunks. We skip those prefix lines so the table
+    state carries across chunk boundaries correctly.
+    """
+    last_rev = None
+    in_rev_table = False
+
+    for text in chunks:
+        for line in text.splitlines():
+            stripped = line.strip()
+            # Strip [filename] prefix. When in a rev table the overlap region
+            # may embed a new row mid-line: "| B.Author | | 2.0 | date |..."
+            # so scan the remainder for "| | value |" inline row boundaries.
+            prefix_m = _CHUNK_TITLE_PREFIX.match(stripped)
+            if prefix_m:
+                if in_rev_table:
+                    remainder = stripped[prefix_m.end():]
+                    for row_m in re.finditer(r'\|\s*\|\s*([^|]{1,80}?)\s*\|', remainder):
+                        val = row_m.group(1).strip()
+                        if val and not re.match(r'^[-\s]+$', val):
+                            last_rev = val
+                continue
+            if not stripped.startswith("|"):
+                if in_rev_table and stripped:
+                    in_rev_table = False
+                continue
+            if _REV_TABLE_HEADER.search(stripped):
+                in_rev_table = True
+                continue
+            if "---" in stripped:
+                continue
+            if in_rev_table:
+                m = _TABLE_ROW.match(stripped)
+                if m:
+                    val = m.group(1).strip()
+                    if val:
+                        last_rev = val
+
+    return last_rev or "—"
+
+
+def _date_from_text(text: str) -> str:
+    m = _DATE_RE.search(text)
+    return m.group(1).strip() if m else "—"
+
 
 _CATALOG_EXTRACT_SYSTEM = """\
-You are extracting specific information from a single document excerpt.
-Return ONLY the values requested, one per line, in exactly this format:
-  Field: value
-If a field is not present in the text write "Field: —".
-No other text, no explanations.\
+You are extracting one specific piece of information from a single document.
+Reply with ONLY the value — no labels, no explanation, no punctuation.
+If the information is not present reply with exactly: —\
 """
 
 
-def _regex_extract(text: str) -> dict[str, str]:
-    """Pull common header fields from text via regex. Returns only matched fields."""
-    found = {}
-    for label, pattern in _FIELD_RES.items():
-        m = pattern.search(text)
-        if m:
-            found[label] = m.group(1).strip()
-    return found
-
-
-async def _llm_extract(filename: str, text: str, fields_needed: list[str]) -> dict[str, str]:
-    """Ask the LLM to extract specific fields from a single document's text."""
-    field_list = "\n".join(f"  {f}:" for f in fields_needed)
-    prompt = (
-        f"Document: {filename}\n\n"
-        f"Text:\n{text[:1200]}\n\n"
-        f"Extract these fields:\n{field_list}"
-    )
+async def _llm_extract_field(filename: str, text: str, field: str) -> str:
+    """Single-field LLM extraction for one document. Used only when code-based
+    extraction returns nothing."""
     try:
-        raw = await llm.chat(system=_CATALOG_EXTRACT_SYSTEM, user=prompt)
-        result = {}
-        for line in raw.splitlines():
-            if ":" in line:
-                key, _, val = line.partition(":")
-                key = key.strip()
-                val = val.strip()
-                if key in fields_needed and val and val != "—":
-                    result[key] = val
-        return result
+        raw = await llm.chat(
+            system=_CATALOG_EXTRACT_SYSTEM,
+            user=f"Document: {filename}\n\nText:\n{text[:1500]}\n\nExtract: {field}",
+        )
+        val = raw.strip().splitlines()[0].strip(" \t:\"'")
+        return val if val and val != "—" else "—"
     except Exception:
-        return {}
+        return "—"
 
 
 async def _catalog_stream(
@@ -91,9 +184,10 @@ async def _catalog_stream(
 ):
     """Per-document extraction loop for catalog queries.
 
-    Tries regex first (instant). Falls back to a single focused LLM call per
-    document for fields not found by regex. Streams each table row as it
-    completes so the user sees progress rather than a blank screen for 3 minutes.
+    For each document: extracts doc number from the filename pattern, finds the
+    latest revision by scanning all page-1 chunks for a revision history table,
+    and falls back to a focused single-document LLM call only for fields that
+    code-based extraction cannot find. Streams each row as it completes.
     """
     docs = ingest.list_documents()
     if folder_filter:
@@ -103,51 +197,54 @@ async def _catalog_stream(
         yield {"sources": [], "done": True}
         return
 
-    # Ask the LLM once to decide which columns to build from the question.
-    try:
-        col_raw = await llm.chat(
-            system="Reply with ONLY a comma-separated list of column names to extract from documents based on the user's request. Maximum 5 columns. No explanations.",
-            user=question,
-        )
-        columns = [c.strip().title() for c in col_raw.split(",") if c.strip()][:5]
-    except Exception:
-        columns = ["Revision", "Document No", "Date"]
+    yield {"token": "| File | Document No | Revision |\n| --- | --- | --- |\n"}
 
-    # Always include filename as first column
-    header = "| File | " + " | ".join(columns) + " |"
-    sep    = "| --- | " + " | ".join(["---"] * len(columns)) + " |"
-    yield {"token": header + "\n" + sep + "\n"}
+    # Batch-fetch all chunks for all documents in one ChromaDB round-trip
+    batch_where = _with_access(
+        _with_folder({"doc_id": {"$in": [d["doc_id"] for d in docs]}}, folder_filter),
+        current_user,
+    )
+    all_fetched = col.get(where=batch_where, include=["documents", "metadatas"])
+    by_doc: dict[str, list[tuple[str, dict]]] = {}
+    for text, meta in zip(all_fetched["documents"], all_fetched["metadatas"]):
+        did = meta["doc_id"]
+        if did not in by_doc:
+            by_doc[did] = []
+        by_doc[did].append((text, meta))
 
     sources = []
     for doc in docs:
-        filename = doc["doc_id"] and doc["filename"]
-        where = _with_access(_with_folder({"doc_id": doc["doc_id"]}, folder_filter), current_user)
-        fetched = col.get(where=where, include=["documents", "metadatas"])
-        if not fetched["ids"]:
+        filename = doc["filename"]
+        items = by_doc.get(doc["doc_id"], [])
+        if not items:
             continue
 
-        # First 3 chunks from page 1
-        page1 = sorted(
-            [(t, m) for t, m in zip(fetched["documents"], fetched["metadatas"])
-             if m.get("chunk_type") != "image" and m.get("page") == 1 and m.get("chunk_index", 0) >= 0],
-            key=lambda x: x[1].get("chunk_index", 0),
-        )[:3]
-        combined = "\n".join(t for t, _ in page1) if page1 else ""
-        if not combined:
-            combined = "\n".join(t for t in fetched["documents"][:2] if t)
+        pairs = sorted(items, key=lambda x: (x[1].get("page", 1), x[1].get("chunk_index", 0)))
+        text_pairs = [(t, m) for t, m in pairs if m.get("chunk_type") != "image" and t]
 
-        # Regex first — instant for common fields
-        found = _regex_extract(combined)
+        def _chunks_for_page(page_num: int) -> list[str]:
+            return [t for t, m in text_pairs if m.get("page") == page_num]
 
-        # LLM fallback for anything regex missed
-        missing = [c for c in columns if c not in found]
-        if missing:
-            llm_found = await _llm_extract(filename, combined, missing)
-            found.update(llm_found)
+        page1_chunks = _chunks_for_page(1)
+        combined = "\n".join(page1_chunks)
 
-        row_cells = [found.get(c, "—") for c in columns]
-        row = f"| {filename} | " + " | ".join(row_cells) + " |"
-        yield {"token": row + "\n"}
+        doc_no   = _doc_number_from_filename(filename)
+        # Running page header is most reliable — every page 2+ stamps the current revision
+        revision = _revision_from_page_headers(text_pairs)
+        # Fallback: revision history table on page 1 or 2
+        if revision == "—":
+            revision = _latest_revision_from_chunks(page1_chunks)
+        if revision == "—":
+            page2_chunks = _chunks_for_page(2)
+            revision = _latest_revision_from_chunks(page2_chunks)
+
+        # LLM fallback only for fields still missing after all code-based attempts
+        if revision == "—":
+            revision = await _llm_extract_field(filename, combined, "the latest revision or version number")
+        if doc_no == "—":
+            doc_no = await _llm_extract_field(filename, combined, "the document or reference number")
+
+        yield {"token": f"| {filename} | {doc_no} | {revision} |\n"}
         sources.append({"filename": filename, "page": 1})
 
     yield {"sources": sources, "done": True}
@@ -155,6 +252,7 @@ async def _catalog_stream(
 log = logging.getLogger(__name__)
 
 _RRF_K = 60
+_EXPAND_WINDOW = 2  # neighbor chunks fetched on each side for parent-chunk retrieval
 
 
 def _find_named_docs(question: str) -> list[str]:
@@ -227,66 +325,66 @@ _FIGURE_NOTE = (
 ) if config.VISION_MODEL else ""
 
 _SYSTEM = """\
-You are Geo-Assist, a senior technical analyst operating in a secure, air-gapped \
-environment. Your role is not to summarise documents — it is to REASON across them \
-and give the user insights, comparisons, and recommendations they could not easily \
-extract themselves.
+You are Geo-Assist, a technical document Q&A assistant operating in a secure, \
+air-gapped environment. You answer questions strictly from the retrieved document \
+excerpts shown at the bottom of this prompt.
 
-HARD CONSTRAINTS — never break these:
-- Every fact, figure, and technical claim must be traceable to the retrieved context \
-  below. Never use knowledge from your training data for factual assertions.
-- If the context does not contain what is needed, say exactly: \
-  "That information is not in the ingested documents." Do not guess or approximate numbers.
+━━━ HARD CONSTRAINTS — these override everything else ━━━
+1. NEVER invent, guess, or produce a filename, document name, document number, \
+   reference number, part number, revision number, or numeric value that is not \
+   explicitly present in the retrieved context below. \
+   If you find yourself writing a name or number that you cannot point to in the \
+   retrieved text, stop and say "That information is not in the ingested documents."
+2. You may ONLY reference documents whose filenames appear in the source list \
+   below. Any other document name does not exist in this system — do not produce it.
+3. Every fact, figure, and technical claim must be traceable to a specific passage \
+   in the retrieved context. Never use knowledge from your training data for \
+   factual assertions.
+4. If the retrieved context does not contain what is needed, say exactly: \
+   "That information is not in the ingested documents." \
+   Do not approximate, extrapolate, or fill gaps from training knowledge.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Documents available in this session (the ONLY sources you may cite):
+{source_list}
 
 Read all retrieved context blocks before writing a single word. Each block is \
-labelled with its source file and page at the top — that label determines which \
-document the text belongs to. Never attribute content from one labelled block to \
-a different document.
+labelled with its source file and page — that label determines which document the \
+text belongs to. Never attribute content from one block to a different document.
 
-{figure_note}When the question names a specific document, use only the blocks labelled with \
-that document. Ignore blocks from other documents for that answer.
+{figure_note}When the question names a specific document, use only blocks labelled \
+with that document.
 
-For specific values, names, or numbers: quote or paraphrase the exact text that \
-supports the claim. If you cannot point to a specific passage, say "I cannot find \
-that in the retrieved text" — never fill the gap with a guess or a value from \
-your training knowledge.
+For specific values, names, or numbers: quote or paraphrase the exact passage that \
+supports the claim. If you cannot point to that passage, say "I cannot find that in \
+the retrieved text." Never fill the gap with a guess.
 
-If the retrieved text contains contradictory information within the same document \
-(e.g. one section says one thing, a table says another), point out the contradiction \
+If the retrieved text contains contradictions within the same document, flag them \
 explicitly rather than picking one silently.
 
-When the question asks for a recommendation or next action, derive it from the \
-technical data in the retrieved blocks: measurements, test results, margins, \
-findings. Do not look for a section explicitly labelled "Recommendations" — reason \
-from the content itself.
+When asked for a recommendation, derive it from measurements, test results, margins, \
+and findings in the retrieved blocks — not from a section labelled "Recommendations".
 
-When asked for a combined or total value, perform the arithmetic and show your \
-working step by step, stating which document each number came from. For mass or \
-weight, use the primary total system mass value, not partial masses such as \
-structural mass, propellant mass, or mass flow rate.
+When asked for a combined or total value, show arithmetic step by step, stating \
+which document each number came from.
 
-When context gives both a nominal value and a tolerance range for the same \
-parameter, state the nominal first and the range second.
+When context gives a nominal value and a tolerance range, state both.
 
-When walking through a procedure, include every explicit timing value — do not \
-omit wait or hold durations.
+When walking through a procedure, include every explicit timing value.
 
-When the user asks to compare, contrast, rank, or tabulate multiple items \
-(e.g. "compare X and Y", "list the specs of A, B, C", "what are the differences between…"), \
-format the response as a markdown table with clear column headers. \
+When asked to compare, contrast, rank, or tabulate multiple items, format the \
+response as a markdown table with clear column headers. \
 Use one row per item and one column per attribute being compared. \
 Add a brief prose summary after the table if the comparison needs context.
 
 After each key factual claim, cite the source file and page in parentheses. \
-If you draw a logical inference from stated facts, say so explicitly before stating it. \
-If the retrieved context does not contain what is needed to answer, say so — \
-do not fabricate numbers or conclusions.
+If you draw a logical inference from stated facts, say so explicitly.
 
 Always respond in the same language the user used in their question. \
 If the user writes in Russian, respond in Russian. \
 If the user writes in Armenian, respond in Armenian. \
-The retrieved context may be in English — that is fine; translate as needed in your response. \
-If you are not confident in a translation of a technical term, include the English term in parentheses.
+The retrieved context may be in English — translate as needed. \
+If unsure of a technical term translation, include the English term in parentheses.
 
 Retrieved context:
 {context}
@@ -316,11 +414,15 @@ Your responsibilities:
    always cross-check the retrieved context for the same parameter and flag any discrepancy.
 
 HARD CONSTRAINTS:
-- Every fact must be traceable to the procedure step text or the retrieved context below.
-- Never fabricate values, steps, or specifications.
+- NEVER invent filenames, document numbers, part numbers, or numeric values not \
+  present in the procedure step or the retrieved context below.
+- Every fact must be traceable to the procedure step text or the retrieved context.
 - If the retrieved context does not contain what is needed, say exactly: \
   "That information is not in the ingested documents."
 - If retrieved context contradicts itself, flag all contradictions explicitly.
+
+Available reference documents (the ONLY sources you may cite):
+{source_list}
 
 {figure_note}Retrieved reference documents:
 {context}
@@ -351,11 +453,12 @@ async def _expand_query(question: str) -> list[str]:
 
 
 async def _semantic_search(col, query: str, k: int, where: dict | None = None,
-                           q_vec: list[float] | None = None) -> dict[str, tuple[str, dict, float]]:
+                           q_vec: list[float] | None = None,
+                           total: int | None = None) -> dict[str, tuple[str, dict, float]]:
     """Single semantic query → {chunk_id: (doc, meta, distance)}."""
     if q_vec is None:
         [q_vec] = await llm.embed([query], prefix="search_query")
-    n = min(k, col.count())
+    n = min(k, total if total is not None else col.count())
     query_kwargs: dict = {
         "query_embeddings": [q_vec],
         "n_results": n,
@@ -376,12 +479,18 @@ async def _semantic_search(col, query: str, k: int, where: dict | None = None,
     return hits
 
 
-def _rrf(ranked_lists: list[list[str]], k: int = _RRF_K) -> dict[str, float]:
-    """Reciprocal Rank Fusion over multiple ranked lists of chunk IDs."""
+def _rrf(ranked_lists: list[list[str]], weights: list[float] | None = None,
+         k: int = _RRF_K) -> dict[str, float]:
+    """Reciprocal Rank Fusion over multiple ranked lists of chunk IDs.
+
+    weights: per-list multipliers (default 1.0 each). Pass [1.0, 2.0] to give
+    the second list (BM25) twice the influence of the first (semantic).
+    """
     scores: dict[str, float] = {}
-    for ranked in ranked_lists:
+    for i, ranked in enumerate(ranked_lists):
+        w = weights[i] if weights else 1.0
         for rank, cid in enumerate(ranked):
-            scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
+            scores[cid] = scores.get(cid, 0.0) + w / (k + rank + 1)
     return scores
 
 
@@ -424,17 +533,13 @@ _NOT_FOUND = "That information is not in the ingested documents."
 
 def _inject_named_docs(
     named_docs: list[str],
-    question: str,
     sem_hits: dict,
     rrf_scores: dict,
     col,
     folder_filter: str | None,
-) -> dict[str, float]:
-    """Guarantee top BM25-ranked chunks from explicitly named documents appear in context.
-
-    Returns the full BM25 score map (reused by system-name injection if called next).
-    """
-    all_bm25 = {cid: score for cid, score in bm25_index.search(question)}
+    all_bm25: dict[str, float],
+) -> None:
+    """Guarantee top BM25-ranked chunks from explicitly named documents appear in context."""
     slots_per_doc = max(2, 8 // len(named_docs))
     for named in named_docs:
         doc_result = col.get(
@@ -459,7 +564,6 @@ def _inject_named_docs(
                     sem_hits[cid] = (doc_result["documents"][idx], doc_result["metadatas"][idx], 994.0)
                 rrf_scores[cid] = max(rrf_scores.get(cid, 0.0), 1.0 / (_RRF_K + 1) * 3)
                 break
-    return all_bm25
 
 
 def _inject_system_names(
@@ -570,20 +674,32 @@ def _catalog_context(
     if not docs:
         return None
 
+    capped = docs[:15]
+    batch_where = _with_access(
+        _with_folder({"doc_id": {"$in": [d["doc_id"] for d in capped]}}, folder_filter),
+        current_user,
+    )
+    all_fetched = col.get(where=batch_where, include=["documents", "metadatas"])
+
+    by_doc: dict[str, list[tuple]] = {}
+    for cid, text, meta in zip(all_fetched["ids"], all_fetched["documents"], all_fetched["metadatas"]):
+        did = meta["doc_id"]
+        if did not in by_doc:
+            by_doc[did] = []
+        by_doc[did].append((cid, text, meta))
+
     context_parts: list[str] = []
     sources: list[dict] = []
     seen: set = set()
 
-    for doc in docs[:15]:
-        doc_id = doc["doc_id"]
-        where = _with_access(_with_folder({"doc_id": doc_id}, folder_filter), current_user)
-        fetched = col.get(where=where, include=["documents", "metadatas"])
-        if not fetched["ids"]:
+    for doc in capped:
+        items = by_doc.get(doc["doc_id"], [])
+        if not items:
             continue
 
         text_chunks = [
             (cid, text, meta)
-            for cid, text, meta in zip(fetched["ids"], fetched["documents"], fetched["metadatas"])
+            for cid, text, meta in items
             if meta.get("chunk_type") != "image" and text and text.strip()
         ]
         if not text_chunks:
@@ -620,6 +736,7 @@ async def _retrieve(question: str, col, folder_filter: str | None = None,
             return result
 
     sem_where = _with_access(_with_folder(None, folder_filter), current_user)
+    total_chunks = col.count()
 
     if config.QUERY_EXPANSION:
         # Start embedding the original query immediately so it overlaps with the LLM
@@ -630,13 +747,13 @@ async def _retrieve(question: str, col, folder_filter: str | None = None,
         extra_vecs = await llm.embed(variants[1:], prefix="search_query") if variants[1:] else []
         [orig_vec] = await orig_embed_task
         sem_results = list(await asyncio.gather(
-            _semantic_search(col, question, config.RETRIEVAL_K, where=sem_where, q_vec=orig_vec),
-            *[_semantic_search(col, q, config.RETRIEVAL_K, where=sem_where, q_vec=v)
+            _semantic_search(col, question, config.RETRIEVAL_K, where=sem_where, q_vec=orig_vec, total=total_chunks),
+            *[_semantic_search(col, q, config.RETRIEVAL_K, where=sem_where, q_vec=v, total=total_chunks)
               for q, v in zip(variants[1:], extra_vecs)]
         ))
     else:
         log.info("queries: %s (expansion disabled)", [question])
-        sem_results = [await _semantic_search(col, question, config.RETRIEVAL_K, where=sem_where)]
+        sem_results = [await _semantic_search(col, question, config.RETRIEVAL_K, where=sem_where, total=total_chunks)]
 
     sem_hits: dict[str, tuple[str, dict, float]] = {}
     for hits in sem_results:
@@ -653,8 +770,15 @@ async def _retrieve(question: str, col, folder_filter: str | None = None,
     if not has_semantic and not named_docs:
         return None
 
-    bm25_results = bm25_index.search(question, folder=folder_filter)
-    bm25_top = [cid for cid, score in bm25_results[:config.RETRIEVAL_K] if score > 0]
+    is_value_query = bool(_VALUE_QUERY_RE.search(question))
+
+    all_bm25_sorted, bm25_filtered = bm25_index.search_with_folder(question, folder=folder_filter)
+    all_bm25 = dict(all_bm25_sorted)
+    # Value queries cast a wider BM25 net — the chunk with the exact number may
+    # rank lower than conceptual chunks in semantic search, so more BM25 candidates
+    # increases the chance of pulling it into context.
+    bm25_k = config.RETRIEVAL_K * 2 if is_value_query else config.RETRIEVAL_K
+    bm25_top = [cid for cid, score in bm25_filtered[:bm25_k] if score > 0]
 
     missing = [cid for cid in bm25_top if cid not in sem_hits]
     if missing:
@@ -663,23 +787,27 @@ async def _retrieve(question: str, col, folder_filter: str | None = None,
             sem_hits[cid] = (doc, meta, 999.0)
 
     sem_ranked = [cid for cid, _ in sorted(sem_hits.items(), key=lambda x: x[1][2])]
-    rrf_scores = _rrf([sem_ranked, bm25_top])
+    # For value queries, weight BM25 at 2× semantic so exact token hits dominate.
+    rrf_weights = [1.0, 2.0] if is_value_query else None
+    rrf_scores = _rrf([sem_ranked, bm25_top], weights=rrf_weights)
 
     named_doc_set: set[str] = set(named_docs)
 
-    all_bm25: dict[str, float] = {}
     if named_docs:
-        all_bm25 = _inject_named_docs(named_docs, question, sem_hits, rrf_scores, col, folder_filter)
+        _inject_named_docs(named_docs, sem_hits, rrf_scores, col, folder_filter, all_bm25)
 
     sys_names = _SYS_REF.findall(question)
     if sys_names:
-        if not all_bm25:
-            all_bm25 = {cid: score for cid, score in bm25_index.search(question)}
         _inject_system_names(sys_names, sem_hits, rrf_scores, named_doc_set, col)
 
     for cid in rrf_scores:
         if cid.endswith("_1_-1"):
             rrf_scores[cid] *= _SUMMARY_BOOST
+
+    if is_value_query:
+        for cid in rrf_scores:
+            if cid in sem_hits and sem_hits[cid][1].get("table_id"):
+                rrf_scores[cid] *= 1.5
 
     if _COMPARISON_RE.search(question):
         await _apply_comparison_boost(question, sem_hits, rrf_scores, col, folder_filter, sem_where)
@@ -702,18 +830,22 @@ async def _retrieve(question: str, col, folder_filter: str | None = None,
             table_ids_in_context.add(tid)
 
     if table_ids_in_context:
+        t_ids = list(table_ids_in_context)
+        t_where = _with_folder(
+            {"table_id": t_ids[0]} if len(t_ids) == 1 else {"table_id": {"$in": t_ids}},
+            folder_filter,
+        )
+        t_result = col.get(where=t_where, include=["documents", "metadatas"])
+        paired = sorted(
+            zip(t_result["ids"], t_result["documents"], t_result["metadatas"]),
+            key=lambda x: (x[2]["page"], x[2].get("chunk_index", 0)),
+        )
         table_cids_ordered: list[str] = []
-        for tid in table_ids_in_context:
-            t_result = col.get(where=_with_folder({"table_id": tid}, folder_filter), include=["documents", "metadatas"])
-            paired = sorted(
-                zip(t_result["ids"], t_result["documents"], t_result["metadatas"]),
-                key=lambda x: (x[2]["page"], x[2].get("chunk_index", 0)),
-            )
-            for cid, doc, meta in paired:
-                if cid not in sem_hits:
-                    sem_hits[cid] = (doc, meta, 995.0)
-                if cid not in top_ids:
-                    table_cids_ordered.append(cid)
+        for cid, doc, meta in paired:
+            if cid not in sem_hits:
+                sem_hits[cid] = (doc, meta, 995.0)
+            if cid not in top_ids:
+                table_cids_ordered.append(cid)
         # Group table chunks first so they appear together at the top of context
         top_ids = table_cids_ordered + [c for c in top_ids if c not in set(table_cids_ordered)]
 
@@ -722,10 +854,58 @@ async def _retrieve(question: str, col, folder_filter: str | None = None,
         log.info("chunk rrf=%.4f dist=%.3f file=%s page=%s text=%r",
                  rrf_scores.get(cid, 0.0), dist, meta["filename"], meta["page"], doc[:80])
 
-    context_parts, sources, seen = [], [], set()
+    # Parent-chunk retrieval: for each selected chunk, fetch ±_EXPAND_WINDOW neighbors
+    # on the same page so the LLM sees the full surrounding paragraph, not just a
+    # 512-char fragment that may start or end mid-sentence.
+    neighbor_pool: set[str] = set()
+    parsed_top: dict[str, tuple[str, int, int]] = {}  # cid → (doc_id, page, chunk_index)
     for cid in top_ids:
-        doc, meta, _ = sem_hits[cid]
-        context_parts.append(f"[{meta['filename']}, page {meta['page']}]\n{doc}")
+        parts = cid.split("_")
+        if len(parts) != 3:
+            continue
+        try:
+            doc_id_p, page_p, idx_p = parts[0], int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        if idx_p < 0:
+            continue  # summary (−1) and image (<−1) chunks: no expansion
+        parsed_top[cid] = (doc_id_p, page_p, idx_p)
+        for d in range(-_EXPAND_WINDOW, _EXPAND_WINDOW + 1):
+            ni = idx_p + d
+            if ni >= 0:
+                neighbor_pool.add(f"{doc_id_p}_{page_p}_{ni}")
+
+    missing_neighbors = neighbor_pool - set(sem_hits.keys())
+    if missing_neighbors:
+        nfetch = col.get(ids=list(missing_neighbors), include=["documents", "metadatas"])
+        for ncid, ndoc, nmeta in zip(nfetch["ids"], nfetch["documents"], nfetch["metadatas"]):
+            sem_hits[ncid] = (ndoc, nmeta, 996.0)
+
+    context_parts, sources, seen = [], [], set()
+    context_cids_used: set[str] = set()
+    for cid in top_ids:
+        _, meta, _ = sem_hits[cid]
+        if cid in parsed_top:
+            doc_id_p, page_p, idx_p = parsed_top[cid]
+            neighbor_cids: list[str] = []
+            for d in range(-_EXPAND_WINDOW, _EXPAND_WINDOW + 1):
+                ni = idx_p + d
+                if ni >= 0:
+                    ncid = f"{doc_id_p}_{page_p}_{ni}"
+                    if ncid in sem_hits:
+                        neighbor_cids.append(ncid)
+            fresh = [ncid for ncid in neighbor_cids if ncid not in context_cids_used]
+            if not fresh:
+                continue  # entire neighborhood already shown in a prior block
+            text = "\n".join(sem_hits[ncid][0] for ncid in neighbor_cids)
+            context_cids_used.update(neighbor_cids)
+        else:
+            if cid in context_cids_used:
+                continue
+            text = sem_hits[cid][0]
+            context_cids_used.add(cid)
+
+        context_parts.append(f"[{meta['filename']}, page {meta['page']}]\n{text}")
         key = (meta["doc_id"], meta["page"])
         if key not in seen:
             seen.add(key)
@@ -754,6 +934,20 @@ def _retrieval_query(question: str, history: list[dict] | None) -> str:
 
 def _build_system(context_parts: list[str], procedure: dict | None) -> str:
     context = "\n\n---\n\n".join(context_parts)
+
+    # Extract unique filenames from context block headers so the model has an
+    # explicit list of what's real — prevents it from inventing document names.
+    seen: set[str] = set()
+    filenames: list[str] = []
+    for part in context_parts:
+        first_line = part.split("\n", 1)[0]  # "[filename, page N]"
+        if first_line.startswith("[") and "," in first_line:
+            fname = first_line[1 : first_line.rfind(",")].strip()
+            if fname and fname not in seen:
+                filenames.append(fname)
+                seen.add(fname)
+    source_list = "\n".join(f"  • {f}" for f in filenames) if filenames else "  (none)"
+
     if procedure:
         steps = procedure["steps"]
         idx = procedure["step_idx"]
@@ -763,9 +957,10 @@ def _build_system(context_parts: list[str], procedure: dict | None) -> str:
             total_steps=len(steps),
             step_text=steps[idx] if steps else "(no steps found)",
             figure_note=_FIGURE_NOTE,
+            source_list=source_list,
             context=context,
         )
-    return _SYSTEM.format(context=context, figure_note=_FIGURE_NOTE)
+    return _SYSTEM.format(context=context, figure_note=_FIGURE_NOTE, source_list=source_list)
 
 
 async def answer(question: str, history: list[dict] | None = None,

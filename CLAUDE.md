@@ -219,6 +219,7 @@ The `#send-btn` is `position: absolute` inside `#input-wrap` — do not add `dis
 - ~~Re-ranking with a cross-encoder after RRF~~ — implemented. Optional; enable with `GEO_RERANK=true`. Requires `pip install -r requirements-reranker.txt` and pre-downloading the model (needs internet once). See `reranker.py` and `config.py`.
 - ~~Delete all / clear collection endpoint~~ — implemented. `DELETE /documents` (requires auth when enabled). "Clear all" button in sidebar UI.
 - ~~Procedure agent mode~~ — implemented. Each doc has a ▶ button (hover to reveal) that starts procedure mode. LLM synthesizes steps from the document content (works on specs, manuals, and descriptions — not just docs with explicit numbered lists). Current step is injected into the system prompt; model is instructed to flag conflicts against retrieved reference docs with `⚠️ CONFLICT:` warnings. See `retriever._generate_procedure_steps()`, `retriever._PROCEDURE_SYSTEM`, `retriever._build_system()`, and the `/procedure/session/*` endpoints in `main.py`.
+- ~~OCR fast-path for image ingestion~~ — implemented. Set `GEO_OCR=true` to enable. Install: `pip install -r requirements-ocr.txt`. OCR (easyocr, CPU-only) runs first on every extracted image; if ≥10 words are found the OCR text is stored directly (sub-second per image). Sparse results fall through to `GEO_VISION_MODEL` if set — so screenshots go through OCR and schematics/wiring diagrams still go to Moondream. The `vision_index.py` backfill script automatically uses the same two-tier logic.
 
 ## Procedure agent
 

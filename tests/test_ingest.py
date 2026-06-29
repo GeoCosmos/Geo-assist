@@ -489,8 +489,9 @@ async def test_tracked_job_fails_gracefully(mock_ollama, monkeypatch):
 # ── vision / image extraction ─────────────────────────────────────────────────
 
 def test_extract_images_skipped_when_no_vision_model(monkeypatch):
-    """extract_images returns [] when VISION_MODEL is not configured."""
+    """extract_images returns [] when neither VISION_MODEL nor OCR_ENABLED is configured."""
     monkeypatch.setattr(config, "VISION_MODEL", "")
+    monkeypatch.setattr(config, "OCR_ENABLED", False)
     result = ingest.extract_images(b"fake pdf", "diagram.pdf")
     assert result == []
 
@@ -618,8 +619,10 @@ def test_extract_images_pdf_deduplicates_by_xref(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_analyze_images_returns_descriptions():
+async def test_analyze_images_returns_descriptions(monkeypatch):
     """_analyze_images calls llm.analyze_image for each image and returns descriptions."""
+    monkeypatch.setattr(config, "VISION_MODEL", "moondream")
+    monkeypatch.setattr(config, "OCR_ENABLED", False)
     img_bytes = b"x" * 100
     images = [(1, 0, img_bytes), (2, 0, img_bytes)]
 
@@ -631,8 +634,10 @@ async def test_analyze_images_returns_descriptions():
 
 
 @pytest.mark.asyncio
-async def test_analyze_images_drops_empty_descriptions():
+async def test_analyze_images_drops_empty_descriptions(monkeypatch):
     """Images where llm.analyze_image returns None/empty are silently dropped."""
+    monkeypatch.setattr(config, "VISION_MODEL", "moondream")
+    monkeypatch.setattr(config, "OCR_ENABLED", False)
     img_bytes = b"x" * 100
     images = [(1, 0, img_bytes), (2, 0, img_bytes)]
 
@@ -673,3 +678,82 @@ async def test_ingest_pdf_with_images_stores_image_chunks(mock_ollama, monkeypat
     ]
     assert image_chunks, "Expected at least one image chunk stored in ChromaDB"
     assert any("rocket thruster" in c for c in image_chunks)
+
+
+# ── OCR two-tier pipeline ─────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_analyze_images_ocr_fast_path(monkeypatch):
+    """OCR result is used and vision model is never called when OCR yields enough words."""
+    monkeypatch.setattr(config, "OCR_ENABLED", True)
+    monkeypatch.setattr(config, "OCR_MIN_WORDS", 3)
+    monkeypatch.setattr(config, "VISION_MODEL", "moondream")
+
+    # Patch _ocr_image to return a text-rich result (simulates a screenshot)
+    monkeypatch.setattr(ingest, "_ocr_image", lambda b: "Error code forty two occurred")
+
+    analyze_mock = AsyncMock(return_value="This should not be called")
+    with patch.object(llm, "analyze_image", new=analyze_mock):
+        results = await ingest._analyze_images([(1, 0, b"x" * 100)], "test.pdf")
+
+    assert len(results) == 1
+    assert results[0][2] == "Error code forty two occurred"
+    analyze_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_analyze_images_ocr_falls_back_to_vision(monkeypatch):
+    """When OCR yields sparse text, the vision model is called as fallback."""
+    monkeypatch.setattr(config, "OCR_ENABLED", True)
+    monkeypatch.setattr(config, "OCR_MIN_WORDS", 10)
+    monkeypatch.setattr(config, "VISION_MODEL", "moondream")
+
+    # Patch _ocr_image to return None (simulates a diagram with little/no text)
+    monkeypatch.setattr(ingest, "_ocr_image", lambda b: None)
+
+    with patch.object(llm, "analyze_image", new=AsyncMock(return_value="Wiring diagram.")):
+        results = await ingest._analyze_images([(1, 0, b"x" * 100)], "test.pdf")
+
+    assert len(results) == 1
+    assert results[0][2] == "Wiring diagram."
+
+
+@pytest.mark.asyncio
+async def test_analyze_images_ocr_only_no_vision_model(monkeypatch):
+    """When OCR is enabled but VISION_MODEL is empty, only OCR runs (no Moondream call)."""
+    monkeypatch.setattr(config, "OCR_ENABLED", True)
+    monkeypatch.setattr(config, "OCR_MIN_WORDS", 3)
+    monkeypatch.setattr(config, "VISION_MODEL", "")
+
+    monkeypatch.setattr(ingest, "_ocr_image", lambda b: "OK status all systems nominal")
+
+    analyze_mock = AsyncMock()
+    with patch.object(llm, "analyze_image", new=analyze_mock):
+        results = await ingest._analyze_images([(1, 0, b"x" * 100)], "test.pdf")
+
+    assert len(results) == 1
+    assert "nominal" in results[0][2]
+    analyze_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_analyze_images_ocr_sparse_no_vision_drops_image(monkeypatch):
+    """When OCR yields nothing AND VISION_MODEL is empty, the image is dropped."""
+    monkeypatch.setattr(config, "OCR_ENABLED", True)
+    monkeypatch.setattr(config, "OCR_MIN_WORDS", 10)
+    monkeypatch.setattr(config, "VISION_MODEL", "")
+
+    monkeypatch.setattr(ingest, "_ocr_image", lambda b: None)
+
+    results = await ingest._analyze_images([(1, 0, b"x" * 100)], "test.pdf")
+    assert results == []
+
+
+def test_extract_images_allowed_when_ocr_enabled_no_vision(monkeypatch):
+    """extract_images proceeds when OCR_ENABLED is True even if VISION_MODEL is empty."""
+    monkeypatch.setattr(config, "VISION_MODEL", "")
+    monkeypatch.setattr(config, "OCR_ENABLED", True)
+    called = []
+    monkeypatch.setattr(ingest, "_extract_images_pdf", lambda d: called.append(1) or [])
+    ingest.extract_images(b"fake", "scan.pdf")
+    assert called
