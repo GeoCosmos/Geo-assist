@@ -30,6 +30,128 @@ _CATALOG_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── per-document catalog extraction ───────────────────────────────────────────
+
+# Regex fast-path for common document header fields.
+_FIELD_RES = {
+    "Revision":      re.compile(r'\b(?:rev(?:ision)?\.?\s*(?:no\.?|#)?|version|ver\.?)\s*[:#.]?\s*([A-Z]?\d+(?:[.\-]\d+)*[A-Za-z]?|[A-Z](?:[.\-]\d+)*)\b', re.IGNORECASE),
+    "Document No":   re.compile(r'\b(?:doc(?:ument)?\.?\s*(?:no\.?|num(?:ber)?|#)|ref(?:erence)?\.?\s*(?:no\.?|#)?)\s*[:#.]?\s*([A-Z0-9][A-Z0-9\-/._]{1,40})', re.IGNORECASE),
+    "Date":          re.compile(r'\b(?:date|effective\s+date|issued|approved)\s*[:#.]?\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{4}[/\-]\d{2}[/\-]\d{2}|\w+\.?\s+\d{1,2},?\s+\d{4})', re.IGNORECASE),
+    "Software Ver":  re.compile(r'\b(?:software\s+(?:version|ver\.?|release)|sw\s+(?:version|ver\.?))\s*[:#.]?\s*([A-Z0-9][A-Z0-9\-._]{0,30})', re.IGNORECASE),
+    "Hardware":      re.compile(r'\b(?:hardware\s+(?:version|ver\.?|revision|rev\.?)|hw\s+(?:version|ver\.?))\s*[:#.]?\s*([A-Z0-9][A-Z0-9\-._]{0,30})', re.IGNORECASE),
+}
+
+_CATALOG_EXTRACT_SYSTEM = """\
+You are extracting specific information from a single document excerpt.
+Return ONLY the values requested, one per line, in exactly this format:
+  Field: value
+If a field is not present in the text write "Field: —".
+No other text, no explanations.\
+"""
+
+
+def _regex_extract(text: str) -> dict[str, str]:
+    """Pull common header fields from text via regex. Returns only matched fields."""
+    found = {}
+    for label, pattern in _FIELD_RES.items():
+        m = pattern.search(text)
+        if m:
+            found[label] = m.group(1).strip()
+    return found
+
+
+async def _llm_extract(filename: str, text: str, fields_needed: list[str]) -> dict[str, str]:
+    """Ask the LLM to extract specific fields from a single document's text."""
+    field_list = "\n".join(f"  {f}:" for f in fields_needed)
+    prompt = (
+        f"Document: {filename}\n\n"
+        f"Text:\n{text[:1200]}\n\n"
+        f"Extract these fields:\n{field_list}"
+    )
+    try:
+        raw = await llm.chat(system=_CATALOG_EXTRACT_SYSTEM, user=prompt)
+        result = {}
+        for line in raw.splitlines():
+            if ":" in line:
+                key, _, val = line.partition(":")
+                key = key.strip()
+                val = val.strip()
+                if key in fields_needed and val and val != "—":
+                    result[key] = val
+        return result
+    except Exception:
+        return {}
+
+
+async def _catalog_stream(
+    question: str,
+    col,
+    folder_filter: str | None,
+    current_user: dict | None,
+):
+    """Per-document extraction loop for catalog queries.
+
+    Tries regex first (instant). Falls back to a single focused LLM call per
+    document for fields not found by regex. Streams each table row as it
+    completes so the user sees progress rather than a blank screen for 3 minutes.
+    """
+    docs = ingest.list_documents()
+    if folder_filter:
+        docs = [d for d in docs if d.get("folder") == folder_filter]
+    if not docs:
+        yield {"token": _NOT_FOUND}
+        yield {"sources": [], "done": True}
+        return
+
+    # Ask the LLM once to decide which columns to build from the question.
+    try:
+        col_raw = await llm.chat(
+            system="Reply with ONLY a comma-separated list of column names to extract from documents based on the user's request. Maximum 5 columns. No explanations.",
+            user=question,
+        )
+        columns = [c.strip().title() for c in col_raw.split(",") if c.strip()][:5]
+    except Exception:
+        columns = ["Revision", "Document No", "Date"]
+
+    # Always include filename as first column
+    header = "| File | " + " | ".join(columns) + " |"
+    sep    = "| --- | " + " | ".join(["---"] * len(columns)) + " |"
+    yield {"token": header + "\n" + sep + "\n"}
+
+    sources = []
+    for doc in docs:
+        filename = doc["doc_id"] and doc["filename"]
+        where = _with_access(_with_folder({"doc_id": doc["doc_id"]}, folder_filter), current_user)
+        fetched = col.get(where=where, include=["documents", "metadatas"])
+        if not fetched["ids"]:
+            continue
+
+        # First 3 chunks from page 1
+        page1 = sorted(
+            [(t, m) for t, m in zip(fetched["documents"], fetched["metadatas"])
+             if m.get("chunk_type") != "image" and m.get("page") == 1 and m.get("chunk_index", 0) >= 0],
+            key=lambda x: x[1].get("chunk_index", 0),
+        )[:3]
+        combined = "\n".join(t for t, _ in page1) if page1 else ""
+        if not combined:
+            combined = "\n".join(t for t in fetched["documents"][:2] if t)
+
+        # Regex first — instant for common fields
+        found = _regex_extract(combined)
+
+        # LLM fallback for anything regex missed
+        missing = [c for c in columns if c not in found]
+        if missing:
+            llm_found = await _llm_extract(filename, combined, missing)
+            found.update(llm_found)
+
+        row_cells = [found.get(c, "—") for c in columns]
+        row = f"| {filename} | " + " | ".join(row_cells) + " |"
+        yield {"token": row + "\n"}
+        sources.append({"filename": filename, "page": 1})
+
+    yield {"sources": sources, "done": True}
+
 log = logging.getLogger(__name__)
 
 _RRF_K = 60
@@ -671,6 +793,13 @@ async def answer_stream(question: str, history: list[dict] | None = None,
         yield {"token": _NOT_FOUND}
         yield {"sources": [], "done": True}
         return
+
+    # Catalog queries bypass normal RAG — extract per-document and stream row by row.
+    if _CATALOG_RE.search(question) and not procedure:
+        async for chunk in _catalog_stream(question, col, folder_filter, current_user):
+            yield chunk
+        return
+
     result = await _retrieve(_retrieval_query(question, history), col,
                              folder_filter=folder_filter, current_user=current_user)
     if result is None:
