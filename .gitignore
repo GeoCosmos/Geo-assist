@@ -28,6 +28,9 @@ handoff.md
 # macOS
 .DS_Store
 
+# Not part of the app
+*.pptx
+
 # Claude Code workspace settings (developer-local, not project config)
 .claude/
 

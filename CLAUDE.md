@@ -28,8 +28,16 @@ These are non-negotiable constraints that must drive every design and implementa
 
 | Hardware | Chat model | OLLAMA_NUM_GPU | EMBED_CONCURRENCY | Expected speed |
 |---|---|---|---|---|
-| T400 / T600 GPU | `llama3.1:8b` | 999 (hybrid) | 4 | ~15 tok/s |
-| CPU only (current) | `llama3.2:latest` | — | 2 | ~4–5 tok/s |
+| T400 / T600 GPU | `qwen3.5:4b` | 999 (hybrid) | 4 | not yet benchmarked on this hardware |
+| CPU only (current) | `qwen3.5:4b` | — | 2 | not yet benchmarked on this hardware |
+
+`qwen3.5:4b` replaced `llama3.1:8b`/`llama3.2:latest` as the default after real
+grounded-accuracy testing showed it beat both (the 8B model self-contradicted
+with multiple wrong values in one answer; the 3B model hallucinated wrong
+values). It requires `"think": false` on every Ollama call (see `llm.py`) or it
+silently burns 20-30s+ per response on hidden reasoning tokens before streaming
+any visible output — this is already applied, but matters if you add new Ollama
+call sites.
 
 ## Stack
 
@@ -37,7 +45,7 @@ These are non-negotiable constraints that must drive every design and implementa
 - **Vector store**: ChromaDB (local persistent, `./data/chroma_db/`)
 - **Keyword index**: BM25 via `rank-bm25` (in-memory, rebuilt on every ingest/delete)
 - **Embeddings**: Ollama `nomic-embed-text` with `search_document:` / `search_query:` task prefixes
-- **Chat model**: Ollama `llama3.1:8b` with GPU, `llama3.2:latest` CPU-only (auto-selected; override with `GEO_CHAT_MODEL`)
+- **Chat model**: Ollama `qwen3.5:4b` (override with `GEO_CHAT_MODEL`)
 - **Frontend**: Single static HTML file (`static/index.html`) — no build step, no Node.js, no CDN dependencies (air-gapped safe)
 - **Static assets**: `static/geocosmos_icon.png` — GeoCosmos company logo served at `/static/geocosmos_icon.png`
 
@@ -60,29 +68,29 @@ These are non-negotiable constraints that must drive every design and implementa
 
 Override any setting before running:
 ```powershell
-$env:GEO_CHAT_MODEL = "llama3.1:8b"
-$env:GEO_VISION_MODEL = "llava:7b"   # optional — enables image analysis
+$env:GEO_CHAT_MODEL = "qwen3.5:4b"
 .\start.ps1
 ```
 
 ### macOS / Linux (dev only)
 
 ```bash
-ollama pull llama3.1:8b && ollama pull nomic-embed-text
+ollama pull qwen3.5:4b && ollama pull nomic-embed-text
 pip3 install -r requirements.txt
-GEO_CHAT_MODEL=llama3.1:8b python3 -m uvicorn main:app --host 127.0.0.1 --port 8743
+GEO_CHAT_MODEL=qwen3.5:4b python3 -m uvicorn main:app --host 127.0.0.1 --port 8743
 ```
 
-### Audio/video support (optional)
+### OCR support (optional)
 
-Audio/video transcription requires `faster-whisper`, which pulls in `torch` and `ctranslate2` (~1–2 GB). It is intentionally excluded from `requirements.txt` to avoid a heavyweight install for users who don't need it.
+OCR extracts text from images embedded in documents (screenshots, UI captures, text-heavy figures) in sub-second time. Images with sparse OCR output (diagrams, schematics) are dropped — there is no vision-model fallback.
 
 To enable:
 ```bash
-pip install -r requirements-audio.txt
+pip install -r requirements-ocr.txt   # ~200 MB — easyocr + PyTorch CPU
+GEO_OCR=true python3 -m uvicorn main:app --host 127.0.0.1 --port 8743
 ```
 
-On CPU-only hardware (no GPU), transcription runs on the `tiny` Whisper model (~39 MB) which fits comfortably in RAM but is slower and less accurate than GPU inference. Image analysis via `GEO_VISION_MODEL` is also possible on CPU — `llava:7b` (~4 GB) fits within 16 GB RAM alongside the chat and embed models, but expect 2–5 minutes per image. Use only for documents where figures are essential to the answers.
+No system binary required — pure pip install. The easyocr model downloads once to `~/.EasyOCR/` on first use (needs internet once; then fully offline). On air-gapped machines, pre-download on a connected machine and copy the cache directory.
 
 ## Testing
 
@@ -122,39 +130,44 @@ geo-assist/
 
 ## RAG pipeline
 
-**Ingestion:** file → text extraction (per page/slide) → recursive character chunking (512 chars, 80 overlap) → table detection (`Table N` regions tagged with `table_id` in metadata) → batch embed with `search_document:` prefix → store in ChromaDB with `{doc_id, filename, page, [table_id]}` metadata. `doc_id = sha256(bytes)[:16]`; re-ingesting the same file is idempotent.
+**Ingestion:** file → text extraction (per page/slide, with headings detected and prepended) → recursive character chunking (512 chars, 80 overlap) → table detection (`Table N` regions tagged with `table_id` in metadata; applies to PDF and DOCX) → summary chunk synthesised (KV-pattern regex → LLM fallback for manuals/reports) → batch embed with `search_document:` prefix → store in ChromaDB with `{doc_id, filename, page, folder, chunk_type, [table_id]}` metadata. `doc_id = sha256(bytes)[:16]`; re-ingesting the same file is idempotent. Up to 16 files prepared concurrently (semaphore-bounded to cap RAM).
+
+**Images (optional):** extracted from PDF/PPTX/DOCX → OCR if `GEO_OCR=true` (easyocr, sub-second; results with fewer than `OCR_MIN_WORDS` words are dropped). Stored as `chunk_type=image` chunks with `chunk_index < -100`. Run as background task — does not block text ingest.
 
 **Query:**
 1. Last user turn from session history prepended to retrieval query (context-aware retrieval for follow-ups)
 2. LLM generates 2 query variants (multi-query expansion)
 3. All 3 queries embedded with `search_query:` prefix, searched concurrently
-4. BM25 keyword search run on original question
-5. Semantic hits + BM25 hits merged via Reciprocal Rank Fusion (RRF, k=60)
-6. If any top chunk has a `table_id`, all chunks sharing that ID are fetched and prepended to context (table completeness)
-7. Top chunks passed as context to the LLM (with session history as prior messages)
-8. LLM answers with cite/calculate/infer rules enforced by system prompt
+4. BM25 keyword search — value queries (pressure, voltage, diameter, etc.) get 2× candidate pool
+5. Semantic hits + BM25 hits merged via Reciprocal Rank Fusion (RRF, k=60); value queries get 2× BM25 weight
+6. Named-doc injection, system-name injection, summary boost, table-chunk boost (1.5× for value queries)
+7. Cross-encoder reranking — scores top 20 (query, chunk) pairs; falls back to RRF order if not installed
+8. If any top chunk has a `table_id`, all chunks sharing that ID are fetched in one batch and prepended (table completeness)
+9. For each selected chunk, ±2 neighbours on the same page fetched and concatenated (parent-chunk expansion)
+10. Top chunks passed as context to the LLM; system prompt includes explicit source-file list to prevent hallucinated citations
+11. LLM answers with cite/calculate/infer rules enforced by system prompt
 
 **Why hybrid:** semantic search misses exact tokens (part numbers, acronyms, numeric units). BM25 rescues these. RRF combines both rankings without needing score normalisation.
 
-**Why table completeness:** PDF tables split across chunk boundaries lose column alignment. When any chunk from a table is retrieved, injecting all sibling chunks ensures the model sees the full table.
+**Why table completeness:** PDF/DOCX tables split across chunk boundaries lose column alignment. When any chunk from a table is retrieved, injecting all sibling chunks ensures the model sees the full table.
+
+**Why parent-chunk expansion:** 512-char chunks can start or end mid-sentence. Fetching ±2 neighbours gives the LLM full paragraphs with proper context boundaries.
 
 ## Key constants (`config.py`)
 
-| Constant | Value | Purpose |
+| Constant | Default | Purpose |
 |---|---|---|
 | `API_PORT` | 8743 | Backend port |
-| `CHAT_MODEL` | `llama3.2:latest` | Ollama chat model (3B; fits in 8GB alongside embed model) |
+| `CHAT_MODEL` | `qwen3.5:4b` | Ollama chat model; requires `"think": false` on every call (see `llm.py`) |
 | `EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model |
 | `CHUNK_SIZE` | 512 | Characters per chunk (~128 tokens) |
 | `CHUNK_OVERLAP` | 80 | Character overlap between chunks |
-| `RETRIEVAL_K` | 15 | Candidates fetched per query before RRF — do not raise above ~20; only 8 chunks reach the LLM and higher values waste ChromaDB + BM25 time |
+| `RETRIEVAL_K` | 15 | Candidates fetched per query before RRF — do not raise above ~20; value queries double this automatically |
 | `DISTANCE_THRESHOLD` | 1.3 | Cosine distance cutoff for semantic gate |
-
-## Security
-
-- **All document-management endpoints require authentication** when `AUTH_ENABLED=True` (the default). This covers: `GET /documents`, `GET /folders`, `POST /documents/{doc_id}/folder`, `DELETE /documents/{doc_id}`, `GET /ingest/status/{job_id}`. Adding a new document-touching endpoint without `Depends(get_current_user)` is a silent auth bypass.
-- `auth.py` uses atomic writes (`os.replace()`) for both `auth.json` and `revocations.json` — never truncate-then-write these files or a crash mid-write will corrupt auth state and lock out all users.
-- `_load()` in `auth.py` raises on JSON corruption rather than returning `{}` (which would re-open the admin setup endpoint). If you see a startup error about corrupt `auth.json`, restore from backup — do not silently swallow the exception.
+| `RERANK_ENABLED` | `true` | Cross-encoder reranking; requires `pip install -r requirements-reranker.txt` (falls back gracefully if not installed) |
+| `RERANK_TOP_N` | 20 | Candidates scored by the cross-encoder |
+| `OCR_ENABLED` | `false` | easyocr fast-path for image text extraction; requires `pip install -r requirements-ocr.txt` |
+| `OCR_MIN_WORDS` | 10 | Minimum word count from OCR to accept the result (below this the image is dropped) |
 
 ## Bulk ingest / reindex scripts
 
@@ -207,19 +220,17 @@ The `#send-btn` is `position: absolute` inside `#input-wrap` — do not add `dis
 ## Phase 2 ideas (not yet implemented)
 
 - ~~Sync conversation history to backend on switch~~ — fixed.
-- ~~Image extraction from PDF/PPTX/DOCX~~ — done. Set `GEO_VISION_MODEL=moondream` (or any vision-capable Ollama model) to enable. Use `vision_index.py` to back-fill image chunks for already-ingested docs (run with server stopped to avoid RAM competition).
 - ~~DOCX/PPTX table extraction~~ — fixed. Tables rendered as markdown; PPTX grouped shapes recursed.
 - ~~CSV telemetry filter false positives~~ — fixed. CSV routed to dedicated `_extract_csv`.
-- ~~Audio/video transcription~~ — implemented. Optional install via `requirements-audio.txt`.
 - ~~Armenian and Russian~~ — implemented. System prompt responds in user's language.
 - ~~Folder management~~ — implemented. Documents stored with folder metadata, moveable, filterable.
 - ~~Folder drag-drop in UI~~ — implemented. Dropping a folder auto-fills the folder name field and recursively collects all files via `webkitGetAsEntry()` (handles the 100-item `readEntries` pagination limit).
 - ~~Comparison/information tables~~ — implemented. LLM formats comparison queries as markdown tables.
 - ~~Table-aware extraction (Phase 2)~~ — implemented. `_extract_pdf` uses `page.find_tables()` (PyMuPDF ≥1.25) and renders tables as markdown in reading order (y0-sorted interleaving of text blocks and table markdown). Documents uploaded before this was added need re-ingestion to benefit.
 - ~~Re-ranking with a cross-encoder after RRF~~ — implemented. Optional; enable with `GEO_RERANK=true`. Requires `pip install -r requirements-reranker.txt` and pre-downloading the model (needs internet once). See `reranker.py` and `config.py`.
-- ~~Delete all / clear collection endpoint~~ — implemented. `DELETE /documents` (requires auth when enabled). "Clear all" button in sidebar UI.
+- ~~Delete all / clear collection endpoint~~ — implemented. `DELETE /documents`. "Clear all" button in sidebar UI.
 - ~~Procedure agent mode~~ — implemented. Each doc has a ▶ button (hover to reveal) that starts procedure mode. LLM synthesizes steps from the document content (works on specs, manuals, and descriptions — not just docs with explicit numbered lists). Current step is injected into the system prompt; model is instructed to flag conflicts against retrieved reference docs with `⚠️ CONFLICT:` warnings. See `retriever._generate_procedure_steps()`, `retriever._PROCEDURE_SYSTEM`, `retriever._build_system()`, and the `/procedure/session/*` endpoints in `main.py`.
-- ~~OCR fast-path for image ingestion~~ — implemented. Set `GEO_OCR=true` to enable. Install: `pip install -r requirements-ocr.txt`. OCR (easyocr, CPU-only) runs first on every extracted image; if ≥10 words are found the OCR text is stored directly (sub-second per image). Sparse results fall through to `GEO_VISION_MODEL` if set — so screenshots go through OCR and schematics/wiring diagrams still go to Moondream. The `vision_index.py` backfill script automatically uses the same two-tier logic.
+- ~~OCR for image ingestion~~ — implemented. Set `GEO_OCR=true` to enable. Install: `pip install -r requirements-ocr.txt`. OCR (easyocr, CPU-only) runs on every image extracted from PDF/PPTX/DOCX; if ≥10 words are found the OCR text is stored as an image chunk (sub-second per image). Sparse results (diagrams, schematics) are dropped — there is no vision-model fallback.
 
 ## Procedure agent
 

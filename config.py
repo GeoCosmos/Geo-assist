@@ -1,18 +1,20 @@
 import os
 
 OLLAMA_BASE = "http://127.0.0.1:11434"
-CHAT_MODEL   = os.environ.get("GEO_CHAT_MODEL",   "llama3.2:latest")
+CHAT_MODEL   = os.environ.get("GEO_CHAT_MODEL",   "qwen3.5:4b")
+# qwen3.5:4b outperformed both llama3.2:latest (3B, hallucinated wrong values) and
+# llama3.1:8b (8B, self-contradicted with multiple wrong values in one answer) on
+# grounded factual accuracy in real testing — bigger isn't better here. Requires
+# "think": false on every Ollama call (see llm.py) or it silently burns 20-30s+ per
+# response on hidden reasoning tokens before streaming any visible output.
 EMBED_MODEL  = os.environ.get("GEO_EMBED_MODEL",  "nomic-embed-text")
 # Defaults to CHAT_MODEL so Ollama never swaps models mid-request.
 # Override with a smaller model (e.g. llama3.2:latest) only if it stays loaded.
 EXPAND_MODEL = os.environ.get("GEO_EXPAND_MODEL", CHAT_MODEL)
-# Set to a local vision-capable model (e.g. "llava:7b") to enable image analysis.
-# Leave empty to skip image extraction entirely (safe default for non-vision setups).
-VISION_MODEL = os.environ.get("GEO_VISION_MODEL", "")
 # Set GEO_OCR=true to enable fast easyocr text extraction from images (screenshots,
 # text-heavy figures). Requires: pip install -r requirements-ocr.txt
-# OCR runs first; images yielding fewer than OCR_MIN_WORDS words fall through to
-# VISION_MODEL if set (for diagrams, schematics, wiring).
+# Images yielding fewer than OCR_MIN_WORDS words are dropped (diagrams, schematics,
+# wiring — no vision-model fallback for these).
 OCR_ENABLED   = os.environ.get("GEO_OCR",           "false").lower() == "true"
 OCR_MIN_WORDS = int(os.environ.get("GEO_OCR_MIN_WORDS", "10"))
 
@@ -21,26 +23,24 @@ OCR_MIN_WORDS = int(os.environ.get("GEO_OCR_MIN_WORDS", "10"))
 QUERY_EXPANSION = os.environ.get("GEO_QUERY_EXPANSION", "false").lower() == "true"
 
 CHUNK_SIZE = 512     # characters — smaller = more focused chunks
-CHUNK_OVERLAP = 80
+CHUNK_OVERLAP = 128
 RETRIEVAL_K = 15     # candidates per query before RRF; final context is 8 chunks
 DISTANCE_THRESHOLD = 1.3
 EMBED_BATCH        = 32
 EMBED_CONCURRENCY  = int(os.environ.get("GEO_EMBED_CONCURRENCY",  "2"))
-VISION_CONCURRENCY = int(os.environ.get("GEO_VISION_CONCURRENCY", "1"))
 MIN_IMAGE_BYTES    = 5_000      # skip decorative icons/backgrounds (< 5 KB)
-MAX_IMAGE_BYTES    = 10_000_000 # skip enormous images that would stall the vision model (> 10 MB)
-VISION_TIMEOUT     = float(os.environ.get("GEO_VISION_TIMEOUT", "600"))  # seconds per image
-VISION_MAX_SIDE    = 1024       # resize to this before sending to the vision model
-VISION_JPEG_QUALITY = 82        # JPEG quality after downscale (strips EXIF implicitly)
+MAX_IMAGE_BYTES    = 10_000_000 # skip enormous images before OCR (> 10 MB)
+OCR_IMAGE_MAX_SIDE    = 1024    # resize to this before OCR
+OCR_IMAGE_JPEG_QUALITY = 82     # JPEG quality after downscale (strips EXIF implicitly)
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 CHROMA_PATH = os.path.join(DATA_DIR, "chroma_db")
 BM25_PATH = os.path.join(DATA_DIR, "bm25_index.pkl")
+# Original uploaded files, kept so citations can link back to the source document.
+# Documents ingested before this was added have no file here (see main.py's
+# /documents/{doc_id}/file — 404s gracefully for those).
+ORIGINALS_DIR = os.path.join(DATA_DIR, "originals")
 API_PORT = 8743
-
-# Set GEO_AUTH=1 to enable multi-user authentication and per-document access control.
-# When disabled (default), the app runs single-user with no login required.
-AUTH_ENABLED = os.environ.get("GEO_AUTH", "0") == "1"
 
 # Cross-encoder re-ranking. Disabled by default — requires sentence-transformers and
 # the model to be pre-downloaded before running in an air-gapped environment.

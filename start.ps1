@@ -4,7 +4,7 @@
 #
 # Usage: double-click start.bat  OR  right-click -> "Run with PowerShell"
 # Override any setting before launching:
-#   $env:GEO_CHAT_MODEL = "llama3.1:8b"
+#   $env:GEO_CHAT_MODEL = "qwen3.5:4b"
 #   $env:GEO_VISION_MODEL = "llava:7b"
 #   .\start.ps1
 
@@ -62,16 +62,22 @@ $env:OLLAMA_NUM_THREADS = "$OllamaThreads"
 
 if ($HasGPU) {
     # T400 / T600: 4 GB GDDR6.
-    # llama3.1:8b  (Q4_K_M ~4.7 GB): ~26 of 32 layers on GPU, rest CPU -> ~15 tok/s
     # nomic-embed-text (~274 MB): always fits alongside the chat model offload.
     $env:OLLAMA_NUM_GPU      = "999"           # fill VRAM with as many layers as fit
-    $DefaultChatModel        = "llama3.1:8b"   # best accuracy for engineering Q&A
+    $DefaultChatModel        = "qwen3.5:4b"    # beat llama3.1:8b on grounded accuracy in
+                                                # testing (8B self-contradicted on factual
+                                                # recall); throughput on T400/T600 not yet
+                                                # benchmarked on this exact hardware.
     $DefaultEmbedConcurrency = "4"             # GPU can pipeline embed batches
     $DefaultVisionConcurrency= "1"             # vision model shares VRAM; one at a time
 } else {
     # CPU-only (Intel UHD 770 integrated).
-    # i7-12700 does ~5 tok/s on 8B, ~14 tok/s on 3B at full DDR5 bandwidth.
-    $DefaultChatModel        = "llama3.2:latest"  # 3B fits in 16 GB RAM; acceptable latency
+    $DefaultChatModel        = "qwen3.5:4b"    # beat llama3.2:latest (3B) on grounded
+                                                # accuracy in testing; similar size/latency
+                                                # profile. Requires "think": false in every
+                                                # Ollama call (see llm.py) or every response
+                                                # silently burns 20-30s+ on hidden reasoning
+                                                # tokens before streaming anything visible.
     $DefaultEmbedConcurrency = "2"                # avoid saturating memory bandwidth
     $DefaultVisionConcurrency= "1"
 }

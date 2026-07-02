@@ -23,14 +23,13 @@ def fresh_chroma(tmp_path, monkeypatch):
     monkeypatch.setattr(ingest, "_chroma_client", client)
     monkeypatch.setattr(ingest, "_chroma", col)
     monkeypatch.setattr(ingest, "_doc_cache", None)
-    monkeypatch.setattr(ingest, "_whisper_model", None)
     monkeypatch.setattr(config, "BM25_PATH", str(tmp_path / "bm25_index.pkl"))
+    monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path / "originals"))
     bm25_index._index.build([], [])   # reset BM25 between tests
     yield col
     ingest._chroma_client = None
     ingest._chroma = None
     ingest._doc_cache = None
-    ingest._whisper_model = None
     bm25_index._index.build([], [])
     client._system.stop()
     client.clear_system_cache()

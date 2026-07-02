@@ -127,7 +127,7 @@ def test_chat_no_docs(mock_ollama):
 def test_chat_returns_answer_and_sources(mock_ollama):
     client.post("/ingest", files={"file": ("t.txt", b"Cumulative GPA: 3.78", "text/plain")})
 
-    async def fake_stream(question, history=None, folder_filter=None, current_user=None, procedure=None):
+    async def fake_stream(question, history=None, folder_filter=None, procedure=None):
         yield {"token": "The GPA is 3.78"}
         yield {"sources": [{"filename": "t.txt", "page": 1}], "done": True}
 

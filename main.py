@@ -1,13 +1,14 @@
 import asyncio
+import glob
 import json
 import logging
 import os
-import time
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -17,9 +18,6 @@ import ingest
 import jobs
 import llm
 import retriever
-
-if config.AUTH_ENABLED:
-    import auth
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -50,143 +48,11 @@ async def health():
         "ollama": ok,
         "chat_model": config.CHAT_MODEL,
         "embed_model": config.EMBED_MODEL,
-        "vision_model": config.VISION_MODEL or None,
         "chunks_stored": col.count(),
     }
 
 
-# ── auth dependency ───────────────────────────────────────────────────────────
-
-def get_current_user(authorization: str | None = Header(None)) -> dict | None:
-    """Return current user dict or None. Raises 401 if auth is enabled and token is missing/invalid."""
-    if not config.AUTH_ENABLED:
-        return None
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Authentication required")
-    try:
-        return auth.verify_token(authorization[7:])
-    except ValueError as e:
-        raise HTTPException(401, str(e))
-
-
-def require_admin(current_user: dict | None = Depends(get_current_user)) -> dict:
-    if not current_user or current_user.get("role") != "admin":
-        raise HTTPException(403, "Admin access required")
-    return current_user
-
-
-# ── auth endpoints ────────────────────────────────────────────────────────────
-
-_login_failures: dict[str, list[float]] = {}  # username → timestamps of recent failures
-_MAX_LOGIN_FAILURES = 10
-_LOCKOUT_SECONDS = 60
-
-
-def _check_login_rate(username: str) -> None:
-    now = time.time()
-    recent = [t for t in _login_failures.get(username, []) if now - t < _LOCKOUT_SECONDS]
-    _login_failures[username] = recent
-    if len(recent) >= _MAX_LOGIN_FAILURES:
-        raise HTTPException(429, f"Too many failed attempts. Try again in {_LOCKOUT_SECONDS}s.")
-
-
-def _record_login_failure(username: str) -> None:
-    _login_failures.setdefault(username, []).append(time.time())
-
-
-def _clear_login_failures(username: str) -> None:
-    _login_failures.pop(username, None)
-
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-class CreateUserRequest(BaseModel):
-    username: str
-    password: str
-    role: str = "user"
-
-
-class UpdateRoleRequest(BaseModel):
-    role: str
-
-
-@app.post("/auth/setup")
-async def auth_setup(req: LoginRequest):
-    """Create the first admin user. Returns 409 once any user exists."""
-    if not config.AUTH_ENABLED:
-        raise HTTPException(404, "Auth is disabled")
-    if auth.has_users():
-        raise HTTPException(409, "Setup already complete — use /auth/users to add more users")
-    user = auth.create_user(req.username, req.password, role="admin")
-    token = auth.create_token(user["username"], user["role"])
-    return {"token": token, "username": user["username"], "role": user["role"]}
-
-
-@app.post("/auth/login")
-async def auth_login(req: LoginRequest):
-    if not config.AUTH_ENABLED:
-        raise HTTPException(404, "Auth is disabled")
-    _check_login_rate(req.username)
-    user = auth.authenticate(req.username, req.password)
-    if not user:
-        _record_login_failure(req.username)
-        raise HTTPException(401, "Invalid username or password")
-    _clear_login_failures(req.username)
-    token = auth.create_token(user["username"], user["role"])
-    return {"token": token, "username": user["username"], "role": user["role"]}
-
-
-@app.get("/auth/me")
-async def auth_me(current_user: dict | None = Depends(get_current_user)):
-    if not config.AUTH_ENABLED:
-        return {"auth_enabled": False}
-    return {"auth_enabled": True, **current_user}
-
-
-@app.get("/auth/users")
-async def auth_list_users(_admin: dict = Depends(require_admin)):
-    return {"users": auth.list_users()}
-
-
-@app.post("/auth/users")
-async def auth_create_user(req: CreateUserRequest, _admin: dict = Depends(require_admin)):
-    try:
-        user = auth.create_user(req.username, req.password, req.role)
-    except ValueError as e:
-        raise HTTPException(409, str(e))
-    return user
-
-
-@app.delete("/auth/users/{username}")
-async def auth_delete_user(username: str, _admin: dict = Depends(require_admin)):
-    if not auth.delete_user(username):
-        raise HTTPException(404, "User not found")
-    return {"deleted": username}
-
-
-@app.patch("/auth/users/{username}/role")
-async def auth_update_role(username: str, req: UpdateRoleRequest, _admin: dict = Depends(require_admin)):
-    if not auth.update_role(username, req.role):
-        raise HTTPException(404, "User not found")
-    return {"username": username, "role": req.role}
-
-
-ALLOWED_EXTENSIONS = {
-    ".pdf", ".docx", ".pptx", ".txt", ".csv",
-    # code files
-    ".py", ".js", ".ts", ".jsx", ".tsx",
-    ".java", ".c", ".cpp", ".h", ".hpp",
-    ".cs", ".go", ".rs", ".rb", ".php",
-    ".swift", ".kt", ".scala", ".r",
-    ".sh", ".ps1", ".bat",
-    ".json", ".yaml", ".yml", ".toml", ".ini", ".env",
-    ".html", ".css", ".xml", ".sql", ".md",
-    # audio / video — transcribed via faster-whisper (requires ffmpeg on PATH)
-    ".mp3", ".mp4", ".wav", ".m4a", ".webm", ".ogg", ".flac", ".mkv", ".mov", ".avi",
-}
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".pptx", ".txt", ".csv"}
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 
 
@@ -205,8 +71,6 @@ def _safe_folder(raw: str) -> str:
 async def ingest_file(
     file: UploadFile = File(...),
     folder: str = Form("General"),
-    access: str = Form("public"),
-    current_user: dict | None = Depends(get_current_user),
 ):
     data = await file.read()
     if not data:
@@ -216,13 +80,8 @@ async def ingest_file(
     ext = Path(file.filename or "").suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Unsupported file type: {ext}")
-    owner = current_user["username"] if current_user else ""
     try:
-        result = await ingest.ingest(data, _safe_filename(file.filename),
-                                     folder=_safe_folder(folder), access=access, owner=owner)
-    except RuntimeError as e:
-        msg = str(e)
-        raise HTTPException(501 if "faster-whisper" in msg else 500, msg)
+        result = await ingest.ingest(data, _safe_filename(file.filename), folder=_safe_folder(folder))
     except Exception as e:
         raise HTTPException(500, str(e))
     return result
@@ -232,8 +91,6 @@ async def ingest_file(
 async def ingest_files_bulk(
     files: list[UploadFile] = File(...),
     folder: str = Form("General"),
-    access: str = Form("public"),
-    current_user: dict | None = Depends(get_current_user),
 ):
     if not files:
         raise HTTPException(400, "No files provided")
@@ -254,16 +111,15 @@ async def ingest_files_bulk(
         items.append((data, _safe_filename(f.filename)))
     if not items:
         raise HTTPException(400, "; ".join(errors) if errors else "No valid files")
-    owner = current_user["username"] if current_user else ""
     job = jobs.create(total=len(items), errors=errors)
-    task = asyncio.create_task(ingest.ingest_many_tracked(items, job, folder=_safe_folder(folder), access=access, owner=owner))
+    task = asyncio.create_task(ingest.ingest_many_tracked(items, job, folder=_safe_folder(folder)))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return {"job_id": job.id, "total": job.total, "skipped": job.errors}
 
 
 @app.get("/ingest/status/{job_id}")
-async def ingest_status(job_id: str, _: dict | None = Depends(get_current_user)):
+async def ingest_status(job_id: str):
     job = jobs.get(job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
@@ -278,12 +134,12 @@ async def ingest_status(job_id: str, _: dict | None = Depends(get_current_user))
 
 
 @app.get("/documents")
-async def list_documents(_: dict | None = Depends(get_current_user)):
+async def list_documents():
     return {"documents": ingest.list_documents()}
 
 
 @app.get("/folders")
-async def list_folders(_: dict | None = Depends(get_current_user)):
+async def list_folders():
     return {"folders": ingest.list_folders()}
 
 
@@ -292,16 +148,28 @@ class MoveFolderRequest(BaseModel):
 
 
 @app.patch("/documents/{doc_id}/folder")
-async def move_document_folder(doc_id: str, req: MoveFolderRequest,
-                               _: dict | None = Depends(get_current_user)):
+async def move_document_folder(doc_id: str, req: MoveFolderRequest):
     moved = ingest.move_document(doc_id, _safe_folder(req.folder))
     if moved == 0:
         raise HTTPException(404, "Document not found")
     return {"moved_chunks": moved}
 
 
+_DOC_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+
+
+@app.get("/documents/{doc_id}/file")
+async def get_document_file(doc_id: str):
+    if not _DOC_ID_RE.match(doc_id):
+        raise HTTPException(404, "Document not found")
+    matches = glob.glob(os.path.join(config.ORIGINALS_DIR, f"{doc_id}.*"))
+    if not matches:
+        raise HTTPException(404, "Original file not available (ingested before this feature was added)")
+    return FileResponse(matches[0], headers={"Content-Disposition": "inline"})
+
+
 @app.delete("/documents/{doc_id}")
-async def delete_document(doc_id: str, _: dict | None = Depends(get_current_user)):
+async def delete_document(doc_id: str):
     removed = ingest.delete_document(doc_id)
     if removed == 0:
         raise HTTPException(404, "Document not found")
@@ -309,7 +177,7 @@ async def delete_document(doc_id: str, _: dict | None = Depends(get_current_user
 
 
 @app.delete("/documents")
-async def clear_all_documents(_: dict | None = Depends(get_current_user)):
+async def clear_all_documents():
     async with ingest._lock:
         removed = ingest.clear_all_documents()
     return {"removed_chunks": removed}
@@ -369,7 +237,7 @@ class ProcedureNavigateRequest(BaseModel):
 
 
 @app.post("/chat/stream")
-async def chat_stream(req: ChatRequest, current_user: dict | None = Depends(get_current_user)):
+async def chat_stream(req: ChatRequest):
     if not req.question.strip():
         raise HTTPException(400, "Question is empty")
     history = _get_history(req.session_id)
@@ -379,7 +247,6 @@ async def chat_stream(req: ChatRequest, current_user: dict | None = Depends(get_
         tokens: list[str] = []
         async for chunk in retriever.answer_stream(req.question, history=history,
                                                    folder_filter=req.folder_filter,
-                                                   current_user=current_user,
                                                    procedure=proc):
             if "token" in chunk:
                 tokens.append(chunk["token"])
@@ -390,15 +257,14 @@ async def chat_stream(req: ChatRequest, current_user: dict | None = Depends(get_
 
 
 @app.post("/chat/session/{session_id}/restore")
-async def restore_session(session_id: str, req: RestoreRequest,
-                          _: dict | None = Depends(get_current_user)):
+async def restore_session(session_id: str, req: RestoreRequest):
     _sessions[session_id] = req.messages[-_MAX_HISTORY_MSGS:]
     _evict_sessions()
     return {"restored": len(_sessions[session_id])}
 
 
 @app.delete("/chat/session/{session_id}")
-async def clear_session(session_id: str, _: dict | None = Depends(get_current_user)):
+async def clear_session(session_id: str):
     _sessions.pop(session_id, None)
     return {"cleared": session_id}
 
@@ -406,8 +272,7 @@ async def clear_session(session_id: str, _: dict | None = Depends(get_current_us
 # ── procedure mode ────────────────────────────────────────────────────────────
 
 @app.post("/procedure/session/{session_id}/start")
-async def procedure_start(session_id: str, req: ProcedureStartRequest,
-                          _: dict | None = Depends(get_current_user)):
+async def procedure_start(session_id: str, req: ProcedureStartRequest):
     col = ingest._db()
     result = col.get(where={"doc_id": req.doc_id}, include=["documents", "metadatas"])
     if not result["ids"]:
@@ -438,8 +303,7 @@ async def procedure_start(session_id: str, req: ProcedureStartRequest,
 
 
 @app.post("/procedure/session/{session_id}/navigate")
-async def procedure_navigate(session_id: str, req: ProcedureNavigateRequest,
-                             _: dict | None = Depends(get_current_user)):
+async def procedure_navigate(session_id: str, req: ProcedureNavigateRequest):
     proc = _proc_sessions.get(session_id)
     if not proc:
         raise HTTPException(404, "No active procedure for this session")
@@ -459,7 +323,7 @@ async def procedure_navigate(session_id: str, req: ProcedureNavigateRequest,
 
 
 @app.delete("/procedure/session/{session_id}")
-async def procedure_end(session_id: str, _: dict | None = Depends(get_current_user)):
+async def procedure_end(session_id: str):
     _proc_sessions.pop(session_id, None)
     return {"ended": session_id}
 

@@ -1,4 +1,5 @@
 import asyncio
+import glob
 import hashlib
 import io
 import logging
@@ -252,63 +253,15 @@ def _extract_text(data: bytes) -> list[tuple[int, str]]:
     return [(1, _filter_telemetry(text))]
 
 
-_AUDIO_VIDEO_EXTS = {".mp3", ".mp4", ".wav", ".m4a", ".webm", ".ogg", ".flac", ".mkv", ".mov", ".avi"}
-
-_whisper_model = None  # lazy singleton — avoids reloading 39 MB on every audio file
-
-
-def _get_whisper_model():
-    global _whisper_model
-    if _whisper_model is None:
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError:
-            raise RuntimeError(
-                "Audio/video transcription requires faster-whisper and ffmpeg. "
-                "Install with: pip install faster-whisper  "
-                "(Windows: winget install ffmpeg)"
-            )
-        _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-    return _whisper_model
-
-
-def _extract_audio(data: bytes, filename: str) -> list[tuple[int, str]]:
-    """Transcribe audio/video using faster-whisper. Returns one page per detected segment group."""
-    import tempfile
-    import os
-
-    suffix = Path(filename).suffix.lower()
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
-
-    try:
-        model = _get_whisper_model()
-        segments, info = model.transcribe(tmp_path, beam_size=5)
-        # Group segments into ~30-second pages to match chunking expectations
-        pages: list[tuple[int, str]] = []
-        page_lines: list[str] = []
-        page_num = 1
-        page_start = 0.0
-        for seg in segments:
-            page_lines.append(seg.text.strip())
-            if seg.end - page_start >= 30.0:
-                pages.append((page_num, " ".join(page_lines)))
-                page_lines = []
-                page_num += 1
-                page_start = seg.end
-        if page_lines:
-            pages.append((page_num, " ".join(page_lines)))
-        return pages if pages else [(1, "")]
-    finally:
-        os.unlink(tmp_path)
-
-
 def _extract_doc_title(pages: list[tuple[int, str]], filename: str) -> str:
-    """Pull the document title from a 'Title : ...' header line, fall back to filename."""
-    if pages:
-        _, first_page = pages[0]
-        for line in first_page.splitlines()[:40]:
+    """Pull the document title from a 'Title : ...' header line, fall back to filename.
+
+    Scans the first few pages, not just page 1 — cover/contact-info front matter
+    (company address blocks, revision tables) commonly pushes the actual title
+    page to page 2 or 3 in real-world manuals.
+    """
+    for _, page_text in pages[:3]:
+        for line in page_text.splitlines()[:40]:
             m = re.match(r"^\s*Title\s*:\s*(.+)", line, re.IGNORECASE)
             if m and m.group(1).strip():
                 return m.group(1).strip()[:120]
@@ -325,8 +278,6 @@ def extract_pages(data: bytes, filename: str) -> list[tuple[int, str]]:
         return _extract_pptx(data)
     if ext == ".csv":
         return _extract_csv(data)
-    if ext in _AUDIO_VIDEO_EXTS:
-        return _extract_audio(data, filename)
     return _extract_text(data)
 
 
@@ -407,7 +358,7 @@ def _extract_images_docx(data: bytes) -> list[tuple[int, int, bytes]]:
 
 def extract_images(data: bytes, filename: str) -> list[tuple[int, int, bytes]]:
     """Return (page_num, img_idx, img_bytes) for each qualifying image in the file."""
-    if not config.VISION_MODEL and not config.OCR_ENABLED:
+    if not config.OCR_ENABLED:
         return []
     ext = Path(filename).suffix.lower()
     if ext == ".pdf":
@@ -420,22 +371,22 @@ def extract_images(data: bytes, filename: str) -> list[tuple[int, int, bytes]]:
 
 
 def _preprocess_image(img_bytes: bytes) -> bytes:
-    """Resize to VISION_MAX_SIDE, re-encode as JPEG at VISION_JPEG_QUALITY, strip metadata."""
+    """Resize to OCR_IMAGE_MAX_SIDE, re-encode as JPEG at OCR_IMAGE_JPEG_QUALITY, strip metadata."""
     import io
     from PIL import Image
     with Image.open(io.BytesIO(img_bytes)) as img:
         img = img.convert("RGB")
-        if max(img.size) > config.VISION_MAX_SIDE:
-            img.thumbnail((config.VISION_MAX_SIDE, config.VISION_MAX_SIDE), Image.LANCZOS)
+        if max(img.size) > config.OCR_IMAGE_MAX_SIDE:
+            img.thumbnail((config.OCR_IMAGE_MAX_SIDE, config.OCR_IMAGE_MAX_SIDE), Image.LANCZOS)
         out = io.BytesIO()
-        img.save(out, format="JPEG", quality=config.VISION_JPEG_QUALITY, optimize=True)
+        img.save(out, format="JPEG", quality=config.OCR_IMAGE_JPEG_QUALITY, optimize=True)
         return out.getvalue()
 
 
 async def _analyze_images(
     images: list[tuple[int, int, bytes]], filename: str
 ) -> list[tuple[int, int, str]]:
-    """Analyze each image with the vision model. Returns (page_num, img_idx, description).
+    """OCR each image. Returns (page_num, img_idx, description).
 
     Images that fail analysis are silently dropped so a bad image never aborts ingest.
     """
@@ -454,10 +405,6 @@ async def _analyze_images(
             ocr_text = await loop.run_in_executor(None, _ocr_image, processed)
             if ocr_text:
                 return (page_num, img_idx, ocr_text)
-
-        if config.VISION_MODEL:
-            desc = await llm.analyze_image(processed, filename, page_num)
-            return (page_num, img_idx, desc) if desc else None
 
         return None
 
@@ -638,14 +585,12 @@ def _summary_chunk(title: str, full_text: str) -> str | None:
 
 
 async def _analyze_and_store_images(
-    doc_id: str, title: str, filename: str,
-    folder: str, access: str, owner: str,
-    raw_images: list,
+    doc_id: str, title: str, filename: str, folder: str, raw_images: list,
 ) -> None:
-    """Background task: run vision analysis then append image chunks to ChromaDB.
+    """Background task: run OCR then append image chunks to ChromaDB.
 
     Fires after text chunks are already committed, so ingest is never blocked
-    waiting for the vision model.
+    waiting on OCR.
     """
     image_descriptions = await _analyze_images(raw_images, filename)
     if not image_descriptions:
@@ -673,8 +618,6 @@ async def _analyze_and_store_images(
                 "filename": filename,
                 "page": c["page"],
                 "folder": folder,
-                "access": access,
-                "owner": owner,
                 "chunk_type": "image",
             }
             for c in image_chunks
@@ -693,18 +636,22 @@ _LLM_SUMMARY_SYSTEM = (
 )
 
 
-async def _llm_summary(title: str, first_page_text: str) -> str | None:
-    """Generate a natural-language summary of a document's first page.
+async def _llm_summary(title: str, front_matter_text: str) -> str | None:
+    """Generate a natural-language summary of a document's front matter.
 
     Called only when KV-pattern extraction produces nothing, so non-spec documents
     (manuals, reports, procedures) still get a summary chunk for cross-doc queries.
+
+    Takes the first few pages, not just page 1 — the actual product/system name
+    is frequently on page 2 or 3 (after a cover/contact-info page), and a summary
+    that misses it can't be matched against a question naming that product.
     """
-    if not first_page_text.strip():
+    if not front_matter_text.strip():
         return None
     try:
         result = await llm.chat(
             system=_LLM_SUMMARY_SYSTEM,
-            user=f"Document: {title}\n\nFirst page:\n{first_page_text[:2000]}",
+            user=f"Document: {title}\n\nFirst pages:\n{front_matter_text[:3000]}",
         )
         return result.strip() or None
     except Exception:
@@ -712,10 +659,17 @@ async def _llm_summary(title: str, first_page_text: str) -> str | None:
         return None
 
 
-async def _prepare(data: bytes, filename: str, folder: str = "General",
-                   access: str = "public", owner: str = "") -> dict:
+async def _prepare(data: bytes, filename: str, folder: str = "General") -> dict:
     """Parse, chunk, and embed one file. The slow part — safe to run concurrently."""
     doc_id = hashlib.sha256(data).hexdigest()[:16]
+
+    # Keep the original file so citations can link back to it. doc_id is a content
+    # hash, so this is naturally idempotent on re-ingest — no lock needed.
+    os.makedirs(config.ORIGINALS_DIR, exist_ok=True)
+    ext = Path(filename).suffix.lower()
+    with open(os.path.join(config.ORIGINALS_DIR, f"{doc_id}{ext}"), "wb") as f:
+        f.write(data)
+
     pages = extract_pages(data, filename)
     chunks = chunk_pages(pages)
     if not chunks:
@@ -728,8 +682,8 @@ async def _prepare(data: bytes, filename: str, folder: str = "General",
     # for manuals, reports, and procedures where no KV rows are present.
     summary = _summary_chunk(title, full_text)
     if not summary:
-        first_page_text = pages[0][1] if pages else ""
-        llm_sum = await _llm_summary(title, first_page_text)
+        front_matter_text = "\n".join(text for _, text in pages[:3])
+        llm_sum = await _llm_summary(title, front_matter_text)
         if llm_sum:
             summary = f"{title} — {llm_sum}"
     summary_chunk_list = [{"page": 1, "chunk_index": -1, "text": summary}] if summary else []
@@ -745,7 +699,7 @@ async def _prepare(data: bytes, filename: str, folder: str = "General",
     raw_images = extract_images(data, filename)
     if raw_images:
         task = asyncio.create_task(
-            _analyze_and_store_images(doc_id, title, filename, folder, access, owner, raw_images)
+            _analyze_and_store_images(doc_id, title, filename, folder, raw_images)
         )
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
@@ -757,8 +711,6 @@ async def _prepare(data: bytes, filename: str, folder: str = "General",
         "doc_id": doc_id,
         "filename": filename,
         "folder": folder,
-        "access": access,
-        "owner": owner,
         "status": "ok",
         "_chunks": all_chunks,
         "_texts": texts,
@@ -777,7 +729,7 @@ def _write(col, payload: dict) -> dict:
     embeddings = payload["_embeddings"]
     existing = col.get(where={"doc_id": doc_id}, include=["metadatas"])
     if existing["ids"]:
-        # Preserve image chunks added by vision_index.py — only replace text chunks
+        # Preserve OCR-derived image chunks — only replace text chunks
         non_image_ids = [
             eid for eid, emeta in zip(existing["ids"], existing["metadatas"])
             if emeta.get("chunk_type") != "image"
@@ -786,16 +738,12 @@ def _write(col, payload: dict) -> dict:
             col.delete(ids=non_image_ids)
     ids = [f"{doc_id}_{c['page']}_{c['chunk_index']}" for c in chunks]
     folder = payload.get("folder", "General")
-    access = payload.get("access", "public")
-    owner  = payload.get("owner", "")
     metadatas = [
         {
             "doc_id": doc_id,
             "filename": filename,
             "page": c["page"],
             "folder": folder,
-            "access": access,
-            "owner": owner,
             **({"table_id": c["table_id"]} if c.get("table_id") else {}),
             **({"chunk_type": c["chunk_type"]} if c.get("chunk_type") else {}),
         }
@@ -803,12 +751,11 @@ def _write(col, payload: dict) -> dict:
     ]
     col.add(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
     _invalidate_cache()
-    return {"doc_id": doc_id, "filename": filename, "folder": folder, "access": access, "owner": owner, "chunks": len(chunks), "status": "ok"}
+    return {"doc_id": doc_id, "filename": filename, "folder": folder, "chunks": len(chunks), "status": "ok"}
 
 
-async def ingest(data: bytes, filename: str, folder: str = "General",
-                 access: str = "public", owner: str = "") -> dict:
-    payload = await _prepare(data, filename, folder=folder, access=access, owner=owner)
+async def ingest(data: bytes, filename: str, folder: str = "General") -> dict:
+    payload = await _prepare(data, filename, folder=folder)
     async with _lock:
         col = _db()
         result = _write(col, payload)
@@ -816,14 +763,13 @@ async def ingest(data: bytes, filename: str, folder: str = "General",
     return result
 
 
-async def ingest_many(files: list[tuple[bytes, str]], folder: str = "General",
-                      access: str = "public", owner: str = "") -> list[dict]:
+async def ingest_many(files: list[tuple[bytes, str]], folder: str = "General") -> list[dict]:
     """Ingest multiple files with concurrent parse+embed, then one write pass and one BM25 rebuild."""
     sem = asyncio.Semaphore(_PREPARE_CONCURRENCY)
 
     async def _bounded(data: bytes, fn: str) -> dict:
         async with sem:
-            return await _prepare(data, fn, folder=folder, access=access, owner=owner)
+            return await _prepare(data, fn, folder=folder)
 
     payloads = await asyncio.gather(*[_bounded(data, fn) for data, fn in files])
     async with _lock:
@@ -833,8 +779,7 @@ async def ingest_many(files: list[tuple[bytes, str]], folder: str = "General",
     return results
 
 
-async def ingest_many_tracked(files: list[tuple[bytes, str]], job,
-                               folder: str = "General", access: str = "public", owner: str = "") -> None:
+async def ingest_many_tracked(files: list[tuple[bytes, str]], job, folder: str = "General") -> None:
     """Background variant of ingest_many. Updates job.prepared as each file
     clears the embed phase, then flips job.status to done/failed at the end.
 
@@ -846,7 +791,7 @@ async def ingest_many_tracked(files: list[tuple[bytes, str]], job,
 
     async def _prepare_and_tick(data: bytes, fn: str) -> dict:
         async with sem:
-            result = await _prepare(data, fn, folder=folder, access=access, owner=owner)
+            result = await _prepare(data, fn, folder=folder)
         job.prepared += 1
         return result
 
@@ -876,8 +821,6 @@ def list_documents() -> list[dict]:
                 "doc_id": doc_id,
                 "filename": m["filename"],
                 "folder": m.get("folder", "General"),
-                "access": m.get("access", "public"),
-                "owner": m.get("owner", ""),
                 "chunks": 0,
             }
         seen[doc_id]["chunks"] += 1
@@ -908,6 +851,8 @@ def delete_document(doc_id: str) -> int:
         col.delete(ids=existing["ids"])
         _invalidate_cache()
         bm25_index.rebuild(col)
+        for path in glob.glob(os.path.join(config.ORIGINALS_DIR, f"{doc_id}.*")):
+            os.remove(path)
     return len(existing["ids"])
 
 
@@ -921,4 +866,6 @@ def clear_all_documents() -> int:
     _chroma = _client().create_collection("docs", metadata={"hnsw:space": "cosine"})
     _invalidate_cache()
     bm25_index.rebuild(_chroma)
+    for path in glob.glob(os.path.join(config.ORIGINALS_DIR, "*")):
+        os.remove(path)
     return count

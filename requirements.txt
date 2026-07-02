@@ -9,5 +9,3 @@ python-multipart>=0.0.20
 rank-bm25>=0.2
 Pillow>=10.0
 nltk>=3.9
-# Audio/video transcription (optional — adds ~1-2 GB via torch/ctranslate2):
-#   pip install -r requirements-audio.txt

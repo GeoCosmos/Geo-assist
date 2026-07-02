@@ -441,8 +441,11 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); }
   border-radius: 99px;
   font-size: 11px;
   color: #0ea5e9;
+  text-decoration: none;
   transition: background .12s;
 }
+a.source-chip { cursor: pointer; }
+a.source-chip:visited { color: #0ea5e9; }
 .source-chip:hover { background: rgba(14,165,233,.14); }
 .source-chip::before { content: "📄"; font-size: 10px; }
 
@@ -477,116 +480,6 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); }
 .thinking span:nth-child(2) { animation-delay: .2s; }
 .thinking span:nth-child(3) { animation-delay: .4s; }
 @keyframes blink { 0%,80%,100% { opacity:.15 } 40% { opacity:1 } }
-
-/* ── login overlay ── */
-#login-overlay {
-  position: fixed; inset: 0;
-  background: rgba(7,11,20,.92);
-  display: flex; align-items: center; justify-content: center;
-  z-index: 9000;
-}
-#login-box {
-  background: #0c1424;
-  border: 1px solid rgba(14,165,233,.2);
-  border-radius: 16px;
-  padding: 36px 40px;
-  width: 340px;
-  display: flex; flex-direction: column; gap: 16px;
-  box-shadow: 0 8px 40px rgba(0,0,0,.5);
-}
-#login-box h2 { color: #e2eaf5; font-size: 20px; font-weight: 700; text-align: center; }
-#login-box p  { color: var(--sidebar-muted); font-size: 12.5px; text-align: center; margin-top: -8px; }
-.login-field { display: flex; flex-direction: column; gap: 5px; }
-.login-field label { font-size: 12px; color: var(--sidebar-muted); }
-.login-field input {
-  padding: 9px 12px;
-  background: rgba(255,255,255,.05);
-  border: 1px solid rgba(14,165,233,.2);
-  border-radius: 8px;
-  color: #e2eaf5; font-size: 13.5px;
-  outline: none;
-  transition: border-color .15s;
-}
-.login-field input:focus { border-color: #0ea5e9; }
-#login-submit {
-  padding: 10px;
-  background: #0ea5e9; color: #fff;
-  border: none; border-radius: 9px;
-  font-size: 14px; font-weight: 600;
-  cursor: pointer;
-  transition: background .15s;
-  margin-top: 4px;
-}
-#login-submit:hover { background: #0284c7; }
-#login-error { color: var(--danger); font-size: 12px; text-align: center; min-height: 16px; }
-
-/* ── user pill in sidebar header ── */
-#user-pill {
-  display: flex; align-items: center; gap: 7px;
-  padding: 6px 16px 8px;
-  font-size: 11.5px;
-  color: var(--sidebar-muted);
-  border-bottom: 1px solid rgba(14,165,233,.08);
-}
-#user-pill .user-name { flex: 1; color: #38bdf8; font-weight: 500; }
-#user-pill .user-role { font-size: 10px; background: rgba(14,165,233,.12); color: #38bdf8; padding: 1px 6px; border-radius: 99px; }
-#logout-btn {
-  background: none; border: none; color: #3a4f6a; cursor: pointer;
-  font-size: 12px; padding: 1px 5px; border-radius: 4px;
-  transition: color .12s;
-}
-#logout-btn:hover { color: var(--danger); }
-
-/* ── access selector in upload ── */
-#access-row {
-  display: flex; align-items: center; gap: 8px;
-  margin: 0 12px 4px; font-size: 11.5px; color: var(--sidebar-muted);
-  flex-shrink: 0;
-}
-#access-row label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
-#access-row input[type=radio] { accent-color: #0ea5e9; }
-
-/* ── admin panel ── */
-#admin-panel {
-  position: fixed; inset: 0;
-  background: rgba(7,11,20,.92);
-  display: none; align-items: center; justify-content: center;
-  z-index: 8000;
-}
-#admin-panel.open { display: flex; }
-#admin-box {
-  background: #0c1424;
-  border: 1px solid rgba(14,165,233,.2);
-  border-radius: 16px;
-  padding: 28px 32px;
-  width: 480px; max-height: 80vh;
-  overflow-y: auto;
-  display: flex; flex-direction: column; gap: 16px;
-  box-shadow: 0 8px 40px rgba(0,0,0,.5);
-}
-#admin-box h2 { color: #e2eaf5; font-size: 18px; font-weight: 700; }
-.admin-close { float: right; background: none; border: none; color: #3a4f6a; cursor: pointer; font-size: 20px; }
-.admin-close:hover { color: var(--danger); }
-.admin-section { display: flex; flex-direction: column; gap: 8px; }
-.admin-section h3 { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .8px; color: rgba(14,165,233,.6); }
-.user-row { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: rgba(255,255,255,.03); border-radius: 8px; }
-.user-row .u-name { flex: 1; font-size: 13px; color: #e2eaf5; }
-.user-row .u-role { font-size: 11px; background: rgba(14,165,233,.12); color: #38bdf8; padding: 1px 7px; border-radius: 99px; }
-.user-row button { background: none; border: 1px solid rgba(14,165,233,.2); border-radius: 5px; color: #38bdf8; font-size: 11px; padding: 2px 8px; cursor: pointer; }
-.user-row button:hover { background: rgba(14,165,233,.1); }
-.user-row .del-user { border-color: rgba(239,68,68,.3); color: var(--danger); }
-.user-row .del-user:hover { background: rgba(239,68,68,.1); }
-.admin-form { display: flex; gap: 6px; flex-wrap: wrap; }
-.admin-form input, .admin-form select {
-  flex: 1; min-width: 100px; padding: 6px 10px;
-  background: rgba(255,255,255,.05); border: 1px solid rgba(14,165,233,.2);
-  border-radius: 7px; color: #e2eaf5; font-size: 13px; outline: none;
-}
-.admin-form button {
-  padding: 6px 14px; background: #0ea5e9; color: #fff;
-  border: none; border-radius: 7px; font-size: 13px; cursor: pointer;
-}
-.admin-form button:hover { background: #0284c7; }
 
 /* ── input bar ── */
 #input-bar {
@@ -702,56 +595,9 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); }
 </style>
 </head>
 <body>
-<!-- Login overlay (shown only when AUTH_ENABLED and not logged in) -->
-<div id="login-overlay" style="display:none">
-  <div id="login-box">
-    <h2>🛰 Geo-Assist</h2>
-    <p>Sign in to continue</p>
-    <div class="login-field">
-      <label for="login-user">Username</label>
-      <input type="text" id="login-user" autocomplete="username" placeholder="username">
-    </div>
-    <div class="login-field">
-      <label for="login-pass">Password</label>
-      <input type="password" id="login-pass" autocomplete="current-password" placeholder="password">
-    </div>
-    <div id="login-error"></div>
-    <button id="login-submit" onclick="doLogin()">Sign in</button>
-  </div>
-</div>
-
-<!-- Admin panel -->
-<div id="admin-panel">
-  <div id="admin-box">
-    <h2>User Management <button class="admin-close" onclick="closeAdmin()">×</button></h2>
-    <div class="admin-section">
-      <h3>Users</h3>
-      <div id="admin-user-list"></div>
-    </div>
-    <div class="admin-section">
-      <h3>Add user</h3>
-      <div class="admin-form">
-        <input type="text" id="new-user-name" placeholder="Username">
-        <input type="password" id="new-user-pass" placeholder="Password">
-        <select id="new-user-role">
-          <option value="user">User</option>
-          <option value="admin">Admin</option>
-        </select>
-        <button onclick="addUser()">Add</button>
-      </div>
-    </div>
-  </div>
-</div>
-
 <div id="app">
   <nav id="sidebar">
     <div class="logo"><span class="logo-icon">🛰</span>Geo-Assist</div>
-    <div id="user-pill" style="display:none">
-      <span class="user-name" id="user-name-label"></span>
-      <span class="user-role" id="user-role-label"></span>
-      <button id="logout-btn" onclick="logout()" title="Sign out">Sign out</button>
-      <button id="admin-btn" style="display:none;background:none;border:1px solid rgba(14,165,233,.2);border-radius:4px;color:#38bdf8;font-size:11px;padding:1px 6px;cursor:pointer" onclick="openAdmin()">⚙ Admin</button>
-    </div>
     <div id="status-pill">
       <div id="status-dot"></div>
       <span id="status-text">Connecting…</span>
@@ -767,16 +613,12 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); }
       <label id="upload-zone">
         <input type="file" id="file-input" multiple>
         <div>⬆ Upload documents</div>
-        <div style="font-size:11px;margin-top:2px">PDF · DOCX · Code · Audio · Video · more</div>
+        <div style="font-size:11px;margin-top:2px">PDF · DOCX · PPTX · TXT · CSV</div>
       </label>
       <div id="folder-input-row">
         <span>📁</span>
         <input type="text" id="folder-input" placeholder="General" list="folder-suggestions">
         <datalist id="folder-suggestions"></datalist>
-      </div>
-      <div id="access-row" style="display:none">
-        <label><input type="radio" name="access" value="public" checked> 🌐 Public</label>
-        <label><input type="radio" name="access" value="private"> 🔒 Private</label>
       </div>
       <div id="progress-bar"><div id="progress-fill"></div></div>
       <div id="ingest-label"></div>
@@ -822,142 +664,8 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); }
 <script>
 const API = '';
 
-// ── auth ──────────────────────────────────────────────────────────────────────
-let _authToken = null;
-let _currentUserInfo = null;
-
-function _authHeaders() {
-  return _authToken ? { 'Authorization': `Bearer ${_authToken}` } : {};
-}
-
 function _apiFetch(url, opts = {}) {
-  opts.headers = { ...(opts.headers || {}), ..._authHeaders() };
   return fetch(url, opts);
-}
-
-async function initAuth() {
-  const me = await _apiFetch(`${API}/auth/me`).then(r => r.json()).catch(() => ({}));
-  if (!me.auth_enabled) return; // auth is off — continue normally
-
-  _authToken = localStorage.getItem('ga-token');
-  if (_authToken) {
-    // Verify token is still valid
-    const meAuth = await _apiFetch(`${API}/auth/me`).then(r => r.json()).catch(() => null);
-    if (meAuth && meAuth.username) {
-      _currentUserInfo = meAuth;
-      showUserPill(meAuth);
-      return;
-    }
-    localStorage.removeItem('ga-token');
-    _authToken = null;
-  }
-  showLoginOverlay();
-}
-
-function showLoginOverlay() {
-  document.getElementById('login-overlay').style.display = 'flex';
-}
-
-function showUserPill(user) {
-  document.getElementById('login-overlay').style.display = 'none';
-  const pill = document.getElementById('user-pill');
-  pill.style.display = 'flex';
-  document.getElementById('user-name-label').textContent = user.username;
-  document.getElementById('user-role-label').textContent = user.role;
-  if (user.role === 'admin') {
-    document.getElementById('admin-btn').style.display = '';
-    document.getElementById('access-row').style.display = 'flex';
-  }
-}
-
-async function doLogin() {
-  const username = document.getElementById('login-user').value.trim();
-  const password = document.getElementById('login-pass').value;
-  const errEl = document.getElementById('login-error');
-  errEl.textContent = '';
-  if (!username || !password) { errEl.textContent = 'Enter username and password'; return; }
-
-  // First-time setup: if no users exist yet, use /auth/setup
-  const meCheck = await fetch(`${API}/auth/me`).then(r => r.json()).catch(() => ({}));
-  const setupEndpoint = meCheck.auth_enabled ? '/auth/login' : null;
-  if (!setupEndpoint) return;
-
-  const r = await fetch(`${API}${setupEndpoint}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
-  });
-  const body = await r.json();
-  if (!r.ok) { errEl.textContent = body.detail || 'Login failed'; return; }
-
-  _authToken = body.token;
-  _currentUserInfo = { username: body.username, role: body.role };
-  localStorage.setItem('ga-token', _authToken);
-  showUserPill(_currentUserInfo);
-  loadDocs();
-}
-
-document.getElementById('login-pass')?.addEventListener('keydown', e => {
-  if (e.key === 'Enter') doLogin();
-});
-
-function logout() {
-  localStorage.removeItem('ga-token');
-  _authToken = null;
-  _currentUserInfo = null;
-  document.getElementById('user-pill').style.display = 'none';
-  showLoginOverlay();
-}
-
-// ── admin panel ───────────────────────────────────────────────────────────────
-function openAdmin() {
-  document.getElementById('admin-panel').classList.add('open');
-  loadAdminUsers();
-}
-function closeAdmin() {
-  document.getElementById('admin-panel').classList.remove('open');
-}
-
-async function loadAdminUsers() {
-  const { users } = await _apiFetch(`${API}/auth/users`).then(r => r.json());
-  const list = document.getElementById('admin-user-list');
-  list.innerHTML = users.map(u => `
-    <div class="user-row">
-      <span class="u-name">${escHtml(u.username)}</span>
-      <span class="u-role">${escHtml(u.role)}</span>
-      <button onclick="changeRole('${escHtml(u.username)}','${u.role === 'admin' ? 'user' : 'admin'}')">
-        Make ${u.role === 'admin' ? 'user' : 'admin'}
-      </button>
-      <button class="del-user" onclick="deleteUser('${escHtml(u.username)}')">Delete</button>
-    </div>
-  `).join('');
-}
-
-async function addUser() {
-  const u = document.getElementById('new-user-name').value.trim();
-  const p = document.getElementById('new-user-pass').value;
-  const r = document.getElementById('new-user-role').value;
-  if (!u || !p) return;
-  await _apiFetch(`${API}/auth/users`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username: u, password: p, role: r }),
-  });
-  document.getElementById('new-user-name').value = '';
-  document.getElementById('new-user-pass').value = '';
-  loadAdminUsers();
-}
-
-async function changeRole(username, newRole) {
-  await _apiFetch(`${API}/auth/users/${username}/role`, {
-    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ role: newRole }),
-  });
-  loadAdminUsers();
-}
-
-async function deleteUser(username) {
-  if (!confirm(`Delete user "${username}"?`)) return;
-  await _apiFetch(`${API}/auth/users/${username}`, { method: 'DELETE' });
-  loadAdminUsers();
 }
 
 // ── health poll ───────────────────────────────────────────────────────────────
@@ -1087,13 +795,6 @@ function inlineMd(text) {
 // ── documents ─────────────────────────────────────────────────────────────────
 const EXT_ICON = {
   pdf:'📄', docx:'📝', pptx:'📊', txt:'📃', csv:'📋',
-  py:'🐍', js:'📜', ts:'📜', jsx:'📜', tsx:'📜',
-  java:'☕', c:'⚙️', cpp:'⚙️', h:'⚙️', hpp:'⚙️', cs:'⚙️', go:'🐹',
-  rs:'🦀', rb:'💎', php:'🐘', swift:'🍎', kt:'🟣', scala:'🔴',
-  sh:'🖥️', ps1:'🖥️', bat:'🖥️',
-  json:'📋', yaml:'📋', yml:'📋', toml:'📋', sql:'🗃️', md:'📘',
-  html:'🌐', css:'🎨', xml:'📋',
-  mp3:'🎵', mp4:'🎬', wav:'🎵', m4a:'🎵', webm:'🎬',
 };
 
 let _activeFolder = null;
@@ -1308,6 +1009,8 @@ function setIngestLock(locked) {
   qInput.placeholder = locked
     ? 'Documents are being processed — please wait…'
     : 'Ask a question about your documents…';
+  zone.style.pointerEvents = locked ? 'none' : '';
+  zone.style.opacity = locked ? '0.5' : '';
 }
 
 function setIngestLabel(text) { document.getElementById('ingest-label').textContent = text; }
@@ -1362,13 +1065,11 @@ async function _readDirEntry(dirEntry) {
 
 async function uploadFiles(files) {
   if (!files.length) return;
+  if (_ingestLocked) { showToast('Upload already in progress — please wait', true); return; }
   const folder = (document.getElementById('folder-input').value || 'General').trim();
-  const accessEl = document.querySelector('input[name="access"]:checked');
-  const access = accessEl ? accessEl.value : 'public';
   const form = new FormData();
   files.forEach(f => form.append('files', f));
   form.append('folder', folder);
-  form.append('access', access);
 
   let job;
   try {
@@ -1392,6 +1093,13 @@ function pollJob(jobId, total) {
   const iv = setInterval(async () => {
     try {
       const r   = await _apiFetch(`${API}/ingest/status/${jobId}`);
+      if (r.status === 404) {
+        clearInterval(iv);
+        bar.style.display = 'none'; fill.style.width = '0%'; setIngestLabel('');
+        setIngestLock(false);
+        showToast('Ingest job lost — server was restarted. Please re-upload your files.', true);
+        return;
+      }
       const job = await r.json();
 
       const pct = total > 0 ? Math.round((job.prepared / total) * 100) : 0;
@@ -1577,9 +1285,7 @@ function renderMsgRow(role, text, sources) {
   if (sources && sources.length) {
     const div = document.createElement('div');
     div.className = 'sources';
-    div.innerHTML = sources.map(s =>
-      `<span class="source-chip">${escHtml(s.filename)}${s.page > 0 ? `, p.${s.page}` : ''}</span>`
-    ).join('');
+    div.innerHTML = sources.map(renderSourceChip).join('');
     row.appendChild(div);
   }
   msgs.appendChild(row);
@@ -1676,9 +1382,7 @@ async function sendMsg() {
           if (finalSources.length && row) {
             const div = document.createElement('div');
             div.className = 'sources';
-            div.innerHTML = finalSources.map(s =>
-              `<span class="source-chip">${escHtml(s.filename)}${s.page > 0 ? `, p.${s.page}` : ''}</span>`
-            ).join('');
+            div.innerHTML = finalSources.map(renderSourceChip).join('');
             row.appendChild(div);
           }
         }
@@ -1705,11 +1409,17 @@ function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
+function renderSourceChip(s) {
+  const label = `${escHtml(s.filename)}${s.page > 0 ? `, p.${s.page}` : ''}`;
+  if (!s.doc_id) return `<span class="source-chip">${label}</span>`;
+  const href = `/documents/${encodeURIComponent(s.doc_id)}/file${s.page > 0 ? `#page=${s.page}` : ''}`;
+  return `<a class="source-chip" href="${href}" target="_blank" rel="noopener">${label}</a>`;
+}
+
 // ── init ──────────────────────────────────────────────────────────────────────
 loadConvs();
 _currentConvId = 'sess_' + Math.random().toString(36).slice(2);
 renderConvList();
-initAuth();
 </script>
 </body>
 </html>

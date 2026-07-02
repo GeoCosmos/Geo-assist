@@ -38,10 +38,12 @@ _COMPARISON_RE = re.compile(
 # Normal RRF (k=8, max_per_file=2) can only surface 4 files at once — catalog
 # mode bypasses that cap and fetches one representative chunk per document.
 _CATALOG_RE = re.compile(
-    r'(?:table|list|overview|summary)\s+of\s+(?:all\s+)?(?:files?|documents?)|'
+    r'(?:table|list|overview|summary|inventory|index)\s+of\s+(?:all\s+)?(?:files?|documents?)|'
+    r'\b(?:create|make|generate|show|give|build|display|produce)\b.{0,40}\b(?:table|list)\b.{0,50}\b(?:documents?|files?|revisions?)\b|'
     r'\b(?:all|each|every)\s+(?:files?|documents?)\b|'
     r'\bfile\s*names?\s*(?:and|with|,)|'
-    r'\b(?:all|each|every|list)\b.{0,40}\brevision\b',
+    r'\bdocument\s+(?:inventory|index|catalog|register)\b|'
+    r'\b(?:all|each|every|list)\b.{0,50}\b(?:revision|version|rev)\b',
     re.IGNORECASE,
 )
 
@@ -69,24 +71,92 @@ def _doc_number_from_filename(filename: str) -> str:
 
 _CHUNK_TITLE_PREFIX = re.compile(r'^\[[^\]]{1,120}\]\s*')
 _PAGE_HEADER_COMBINED = re.compile(
-    # "Issue 3  Rev 2" / "Ed. 3  Rév. 2" / "Is. 3  Rev. 2" — issue + revision as separate fields
-    r'(?:iss?ue|ed(?:ition)?\.?|éd(?:ition)?\.?)\s*[:\.]?\s*(\d+)\s{0,15}'
-    r'(?:rev(?:ision)?\.?|rév\.?)\s*[:\.]?\s*(\d[\w\.]*)',
+    # "Issue 3 Rev 2" / "Is. 3 - Rev. 2" / "Ed. 3 Rev. 2"
+    # "is\.?" recognises the "Is." abbreviation; [^a-zA-Z\d]{0,20} handles
+    # arbitrary separators between the issue number and "Rev" (" - ", "/", etc.)
+    r'(?<!\w)(?:iss?ue|is\.?|ed(?:ition)?\.?|éd(?:ition)?\.?)\s*[:\.]?\s*(\d+)'
+    r'[^a-zA-Z\d]{0,20}'
+    r'(?:rev(?:ision)?\.?|rév\.?)\s*[:\. ]?\s*([A-Za-z]\d*|\d[\w\.]*)',
     re.IGNORECASE,
 )
 _PAGE_HEADER_REV = re.compile(
-    # Standalone: must have explicit label + colon/dot to avoid matching section/table numbers
-    r'(?:is\.?\s*rev(?:ision)?|rev(?:ision)?\.?|rév(?:ision)?\.?)\s*[:\.]\s*(\d[\w\.]*)',
+    # Standalone: label + separator (colon, dot, dash, or horizontal space) + value.
+    # [ \t]* instead of \s* prevents the pattern from spanning newlines and accidentally
+    # matching column headers like "Is.\nRev.\nDate" (capturing "D" from "Date").
+    r'(?:is\.?[ \t]*rev(?:ision)?|rev(?:ision)?\.?|rév(?:ision)?\.?|version\.?)'
+    r'[ \t]*(?:[:\-\.]|[ \t])[ \t]*([A-Za-z]\d*|\d[\w\.]*)',
     re.IGNORECASE,
+)
+# Inline fallback: "Revision: B", "Version: 2.1" in body text.
+# Only colon/dash accepted as separators — period is part of the abbreviation ("Rev.")
+# not a separator, so allowing it caused "Rev. 9" to be parsed as revision "9" without
+# the accompanying issue number.
+_INLINE_REV_RE = re.compile(
+    r'(?<!\w)(?:rev(?:ision)?|version|ver)\.?\s*[:\-]\s*([A-Za-z]\d*|\d[\w\.]*)',
+    re.IGNORECASE,
+)
+# "Is.Rev 3.10" / "Is.Rev: 3.10" — combined label; colon and space are both valid separators
+_IS_REV_DOTNUM_RE = re.compile(r'\bIs\.?\s*Rev\.?[\s:]*(\d+[\.\-]\d+)', re.IGNORECASE)
+# "Is. 5 - Rev. 9" / "Is. 3 – Rev. 10" — split Issue+Rev with explicit separator
+_IS_NUM_REV_NUM_RE = re.compile(
+    r'(?<!\w)Is\.?\s*(\d+)\s*[-–]\s*Rev\.?\s*(\d+)\b',
+    re.IGNORECASE,
+)
+# "E3R10" compact format — edition number + revision number, find highest pair
+_EXRX_RE = re.compile(r'\b[Ee](\d+)[Rr](\d+)\b')
+# "Is.Rev E3R10" — EXRX with explicit Is.Rev label; bare EXRX like "IMP000074 e14r1"
+# (part-number suffixes) is excluded to prevent false positives.
+_IS_REV_EXRX_RE = re.compile(
+    r'\bIs\.?\s*Rev\.?\s*[:\s]*[Ee](\d+)[Rr](\d+)\b',
+    re.IGNORECASE,
+)
+# Two-column table cell matchers — for "| Is. | Rev. |" separate-column format
+_TWO_COL_IS_RE = re.compile(r'^(?:iss?ue|is)\.?$', re.IGNORECASE)
+_TWO_COL_REV_RE = re.compile(r'^rev(?:ision)?\.?$', re.IGNORECASE)
+# Dates look like revisions but aren't — used to filter table cell values
+_DATE_FILTER_RE = re.compile(
+    r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}$|^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}$'
 )
 
 
-def _revision_from_page_headers(text_pairs: list[tuple[str, dict]]) -> str:
+def _rev_sort_key(s: str) -> tuple:
+    """Version-aware sort key: '3.10' > '3.9', 'E3R10' > 'E3R5', 'C' > 'B'."""
+    return tuple(
+        (0, int(tok)) if tok.isdigit() else (1, tok.upper())
+        for tok in re.findall(r'\d+|[A-Za-z]+', s)
+    )
+
+
+def _exrx_to_dotnum(s: str) -> str:
+    """Convert 'E3R10' compact EXRX format to '3.10'; leave other strings unchanged."""
+    m = _EXRX_RE.fullmatch(s.strip())
+    return f"{m.group(1)}.{m.group(2)}" if m else s
+
+
+def _is_rev_candidate(s: str) -> bool:
+    """True when s looks like a revision value (not a date, description, or dash row)."""
+    if not s or len(s) > 20 or re.match(r'^[-\s]+$', s):
+        return False
+    if _DATE_FILTER_RE.fullmatch(s):
+        return False
+    # Spaces/parens indicate a word phrase or annotation, not a revision identifier
+    if re.search(r'[\s()]', s):
+        return False
+    return bool(re.search(r'\d', s) or (len(s) <= 2 and s.isalpha()))
+
+
+def _revision_from_page_headers(
+    text_pairs: list[tuple[str, dict]], *, tight: bool = False
+) -> str:
     """Extract revision from running page headers (top of page 2+).
 
-    SAFRAN manuals stamp the current revision on every page header. We look at
-    the first chunk of each page beyond page 1. Try combined Issue+Rev first
-    (e.g. "Issue 3 Rev 2" → "3/2"), then standalone Rev label.
+    Priority order per page: combined Issue+Rev → Is.Rev N.M dotnum →
+    standalone Rev label → EXRX compact format (E3R10).
+
+    When tight=True, only COMBINED and DOTNUM patterns are tried — REV and EXRX
+    are skipped.  Use tight mode when table/label scan already returned a dotnum
+    so that bare "version X" body text and catalog EXRX codes (e.g. "IMP000074
+    e14r1" in copyright footers) cannot override an authoritative table value.
     """
     pages_seen: set[int] = set()
     for text, meta in text_pairs:
@@ -94,27 +164,61 @@ def _revision_from_page_headers(text_pairs: list[tuple[str, dict]]) -> str:
         if page <= 1 or page in pages_seen:
             continue
         pages_seen.add(page)
-        top = "\n".join(text.splitlines()[:10])
+        # Scan only lines before the first pipe table row — table body content must
+        # not be treated as a running header (e.g. description columns contain
+        # "first version for external diffusion" which would match "version X").
+        header_lines: list[str] = []
+        for ln in text.splitlines()[:10]:
+            if ln.strip().startswith("|"):
+                break
+            header_lines.append(ln)
+        if not any(ln.strip() for ln in header_lines):
+            continue
+        top = "\n".join(header_lines)
         m = _PAGE_HEADER_COMBINED.search(top)
         if m:
-            return f"{m.group(1)}/{m.group(2).strip()}"
+            return f"{m.group(1)}.{m.group(2).strip()}"
+        m = _IS_REV_DOTNUM_RE.search(top)
+        if m:
+            return m.group(1)
+        if tight:
+            continue
         m = _PAGE_HEADER_REV.search(top)
         if m:
             return m.group(1).strip()
+        m = _EXRX_RE.search(top)
+        if m:
+            return f"{m.group(1)}.{m.group(2)}"
     return "—"
 
 
-def _latest_revision_from_chunks(chunks: list[str]) -> str:
-    """Scan all page-1 chunk text for a revision history table and return the
-    last non-empty revision value.
+def _latest_revision_from_chunks(chunks: list[str], *, skip_inline: bool = False) -> str:
+    """Scan chunk text for a revision value.
 
-    Each chunk stored in ChromaDB starts with a [filename] prefix line. That
-    non-pipe line would normally reset in_rev_table=False mid-table when the
-    same table spans multiple chunks. We skip those prefix lines so the table
-    state carries across chunk boundaries correctly.
+    Strong signals (steps 1-3) are all collected and the highest is returned so
+    that "Is. 5 - Rev. 9" in a running-header body chunk can beat "5.8" found
+    in a truncated pipe table.  The inline fallback (step 4) is intentionally
+    excluded when skip_inline=True so that a caller can run a second pass on a
+    different page before resorting to weak heuristics.
+
+    1. Revision table (pipe format) — highest value, handles two-column Is./Rev.
+    1b. "Is. N - Rev. M" / "Is. N – Rev. M" split format in body text
+    2. "Is.Rev 3.10" / "Is.Rev: 3.10" combined label in body text
+    3. Is.Rev-labeled EXRX — bare "e14r1" part-number suffixes are excluded
+    4. Inline fallback: "Revision: B", "Version: 2.1" (skip_inline=False only)
     """
-    last_rev = None
+    candidates: list[str] = []
+
+    # ── 1. Table scan ──────────────────────────────────────────────────────
+    all_table_revs: list[str] = []
     in_rev_table = False
+    is_col_idx = -1
+    rev_col_idx = -1
+    # Track the "Table N" label under which the Is.Rev header was found so that
+    # continuation chunks on later pages (which omit the header row) can re-enter
+    # revision-table mode when they start with "[filename] Table N".
+    rev_table_label: str | None = None
+    last_non_pipe: str | None = None
 
     for text in chunks:
         for line in text.splitlines():
@@ -124,30 +228,110 @@ def _latest_revision_from_chunks(chunks: list[str]) -> str:
             # so scan the remainder for "| | value |" inline row boundaries.
             prefix_m = _CHUNK_TITLE_PREFIX.match(stripped)
             if prefix_m:
+                remainder = stripped[prefix_m.end():]
                 if in_rev_table:
-                    remainder = stripped[prefix_m.end():]
                     for row_m in re.finditer(r'\|\s*\|\s*([^|]{1,80}?)\s*\|', remainder):
                         val = row_m.group(1).strip()
-                        if val and not re.match(r'^[-\s]+$', val):
-                            last_rev = val
+                        if _is_rev_candidate(val):
+                            all_table_revs.append(val)
+                elif rev_table_label and remainder.startswith(rev_table_label):
+                    # Continuation chunk for the same named table on a later page
+                    in_rev_table = True
+                    is_col_idx = rev_col_idx = -1
                 continue
             if not stripped.startswith("|"):
                 if in_rev_table and stripped:
                     in_rev_table = False
-                continue
-            if _REV_TABLE_HEADER.search(stripped):
-                in_rev_table = True
+                    is_col_idx = rev_col_idx = -1
+                if stripped:
+                    last_non_pipe = stripped
                 continue
             if "---" in stripped:
                 continue
-            if in_rev_table:
-                m = _TABLE_ROW.match(stripped)
-                if m:
-                    val = m.group(1).strip()
-                    if val:
-                        last_rev = val
 
-    return last_rev or "—"
+            cells = [c.strip() for c in stripped.split("|")]
+
+            if _REV_TABLE_HEADER.search(stripped):
+                # Single-column combined header: | Is.Rev |, | Revision |, etc.
+                in_rev_table = True
+                is_col_idx = rev_col_idx = -1
+                # Remember the preceding "Table N" label so later pages can re-enter
+                if last_non_pipe and re.match(r'^Table\s+\d+$', last_non_pipe, re.IGNORECASE):
+                    rev_table_label = last_non_pipe
+                continue
+
+            # Two-column header: | Is. | Rev. | (separate columns)
+            if not in_rev_table:
+                c_is = next((i for i, c in enumerate(cells) if _TWO_COL_IS_RE.fullmatch(c)), -1)
+                c_rv = next((i for i, c in enumerate(cells) if _TWO_COL_REV_RE.fullmatch(c)), -1)
+                if c_is >= 0 and c_rv >= 0:
+                    in_rev_table = True
+                    is_col_idx = c_is
+                    rev_col_idx = c_rv
+                    continue
+
+            if in_rev_table:
+                if is_col_idx >= 0 and rev_col_idx >= 0:
+                    # Two-column: combine Is. and Rev. cell values as "N.M"
+                    try:
+                        is_val = cells[is_col_idx] if is_col_idx < len(cells) else ""
+                        rv_val = cells[rev_col_idx] if rev_col_idx < len(cells) else ""
+                        combined = f"{is_val}.{rv_val}"
+                        if _is_rev_candidate(is_val):
+                            all_table_revs.append(combined)
+                    except IndexError:
+                        pass
+                else:
+                    m = _TABLE_ROW.match(stripped)
+                    if m:
+                        val = m.group(1).strip()
+                        if _is_rev_candidate(val):
+                            all_table_revs.append(val)
+
+    if all_table_revs:
+        candidates.append(_exrx_to_dotnum(max(all_table_revs, key=_rev_sort_key)))
+
+    # ── 1b. "Is. N - Rev. M" split format in body text ────────────────────
+    # Collected alongside the table so the highest of the two wins (e.g. when
+    # the revision history table stops at 5.8 but the running header says 5.9).
+    all_is_rev_split: list[tuple[int, int]] = []
+    for text in chunks:
+        for m in _IS_NUM_REV_NUM_RE.finditer(text):
+            all_is_rev_split.append((int(m.group(1)), int(m.group(2))))
+    if all_is_rev_split:
+        best_split = max(all_is_rev_split)
+        candidates.append(f"{best_split[0]}.{best_split[1]}")
+
+    # ── 2. Is.Rev N.M combined label in body text ──────────────────────────
+    for text in chunks:
+        m = _IS_REV_DOTNUM_RE.search(text)
+        if m:
+            candidates.append(m.group(1))
+            break
+
+    # ── 3. Is.Rev EXRX (labeled only) — bare EXRX like "IMP000074 e14r1" excluded ──
+    all_labeled_exrx: list[tuple[int, int]] = []
+    for text in chunks:
+        for m in _IS_REV_EXRX_RE.finditer(text):
+            all_labeled_exrx.append((int(m.group(1)), int(m.group(2))))
+    if all_labeled_exrx:
+        best_exrx = max(all_labeled_exrx)
+        candidates.append(f"{best_exrx[0]}.{best_exrx[1]}")
+
+    if candidates:
+        return _exrx_to_dotnum(max(candidates, key=_rev_sort_key))
+
+    # ── 4. Inline fallback (weakest — caller may suppress via skip_inline) ──
+    if not skip_inline:
+        _skip = re.compile(r'^(of|in|at|by|the|a|an|history|log|control|status)$', re.IGNORECASE)
+        for text in chunks:
+            m = _INLINE_REV_RE.search(text)
+            if m:
+                val = m.group(1).strip()
+                if val and not _skip.match(val):
+                    return _exrx_to_dotnum(val)
+
+    return "—"
 
 
 def _date_from_text(text: str) -> str:
@@ -180,14 +364,13 @@ async def _catalog_stream(
     question: str,
     col,
     folder_filter: str | None,
-    current_user: dict | None,
 ):
     """Per-document extraction loop for catalog queries.
 
-    For each document: extracts doc number from the filename pattern, finds the
-    latest revision by scanning all page-1 chunks for a revision history table,
-    and falls back to a focused single-document LLM call only for fields that
-    code-based extraction cannot find. Streams each row as it completes.
+    All code-based extractions run concurrently via asyncio.gather. LLM fallback
+    calls are serialised through a semaphore so Ollama isn't flooded on CPU hardware.
+    The table header streams immediately; rows appear in original doc order once all
+    extractions complete.
     """
     docs = ingest.list_documents()
     if folder_filter:
@@ -199,11 +382,7 @@ async def _catalog_stream(
 
     yield {"token": "| File | Document No | Revision |\n| --- | --- | --- |\n"}
 
-    # Batch-fetch all chunks for all documents in one ChromaDB round-trip
-    batch_where = _with_access(
-        _with_folder({"doc_id": {"$in": [d["doc_id"] for d in docs]}}, folder_filter),
-        current_user,
-    )
+    batch_where = _with_folder({"doc_id": {"$in": [d["doc_id"] for d in docs]}}, folder_filter)
     all_fetched = col.get(where=batch_where, include=["documents", "metadatas"])
     by_doc: dict[str, list[tuple[str, dict]]] = {}
     for text, meta in zip(all_fetched["documents"], all_fetched["metadatas"]):
@@ -212,12 +391,14 @@ async def _catalog_stream(
             by_doc[did] = []
         by_doc[did].append((text, meta))
 
-    sources = []
-    for doc in docs:
+    # One LLM call at a time — Ollama on CPU is single-threaded anyway
+    llm_sem = asyncio.Semaphore(1)
+
+    async def _extract_row(doc) -> tuple[str, str, str, str] | None:
         filename = doc["filename"]
         items = by_doc.get(doc["doc_id"], [])
         if not items:
-            continue
+            return None
 
         pairs = sorted(items, key=lambda x: (x[1].get("page", 1), x[1].get("chunk_index", 0)))
         text_pairs = [(t, m) for t, m in pairs if m.get("chunk_type") != "image" and t]
@@ -229,23 +410,45 @@ async def _catalog_stream(
         combined = "\n".join(page1_chunks)
 
         doc_no   = _doc_number_from_filename(filename)
-        # Running page header is most reliable — every page 2+ stamps the current revision
-        revision = _revision_from_page_headers(text_pairs)
-        # Fallback: revision history table on page 1 or 2
-        if revision == "—":
-            revision = _latest_revision_from_chunks(page1_chunks)
-        if revision == "—":
-            page2_chunks = _chunks_for_page(2)
-            revision = _latest_revision_from_chunks(page2_chunks)
 
-        # LLM fallback only for fields still missing after all code-based attempts
-        if revision == "—":
-            revision = await _llm_extract_field(filename, combined, "the latest revision or version number")
-        if doc_no == "—":
-            doc_no = await _llm_extract_field(filename, combined, "the document or reference number")
+        # ── Strong-signal pass (no inline fallback) ──────────────────────────
+        # Scan ALL pages at once so revision tables that span multiple pages are
+        # read completely — only scanning pages 1-2 would truncate the max value.
+        # Tight-header mode engages when any table/label result is found, preventing
+        # body-text false positives and catalog EXRX codes from overriding it.
+        all_chunks = [t for t, m in text_pairs]
+        strong: list[str] = []
+        r_all = _latest_revision_from_chunks(all_chunks, skip_inline=True)
+        if r_all != "—":
+            strong.append(r_all)
+        rh = _revision_from_page_headers(text_pairs, tight=bool(strong))
+        if rh != "—":
+            strong.append(rh)
 
+        revision = _exrx_to_dotnum(max(strong, key=_rev_sort_key)) if strong else "—"
+
+        # ── Inline fallback (weak — only if all strong signals failed) ───────
+        if revision == "—":
+            revision = _latest_revision_from_chunks(all_chunks)
+
+        if revision == "—" or doc_no == "—":
+            async with llm_sem:
+                if revision == "—":
+                    revision = await _llm_extract_field(filename, combined, "the latest revision or version number")
+                if doc_no == "—":
+                    doc_no = await _llm_extract_field(filename, combined, "the document or reference number")
+
+        return (filename, doc_no, revision, doc["doc_id"])
+
+    rows = await asyncio.gather(*[_extract_row(doc) for doc in docs])
+
+    sources = []
+    for row in rows:
+        if row is None:
+            continue
+        filename, doc_no, revision, doc_id = row
         yield {"token": f"| {filename} | {doc_no} | {revision} |\n"}
-        sources.append({"filename": filename, "page": 1})
+        sources.append({"filename": filename, "page": 1, "doc_id": doc_id})
 
     yield {"sources": sources, "done": True}
 
@@ -273,6 +476,10 @@ def _find_named_docs(question: str) -> list[str]:
 
 
 _SUMMARY_BOOST = 3.0
+# Sentinel distance values assigned by injection helpers to force-added chunks.
+# These chunks must survive the post-rerank cap — they carry pipeline guarantees
+# (named-doc, sys-name, comparison-boost) that must not be silenced by the reranker.
+_INJECTED_SENTINELS = frozenset({991.0, 994.0, 997.0, 998.0})
 
 _PROCEDURE_EXTRACT_SYSTEM = """\
 You are a technical procedure specialist. Given the content of an engineering document, \
@@ -315,14 +522,14 @@ async def _generate_procedure_steps(chunks: list[str]) -> list[str]:
         log.warning("procedure step generation failed", exc_info=True)
     return [c.strip() for c in chunks if c.strip()]
 
-# Included in the system prompt only when vision analysis is enabled, so the LLM
-# is not primed to look for figure annotations that will never appear.
+# Included in the system prompt only when OCR is enabled, so the LLM is not
+# primed to look for figure annotations that will never appear.
 _FIGURE_NOTE = (
-    "Some blocks begin with \"[Figure on page N]:\" — these are AI-generated descriptions "
-    "of images extracted from that document page. Treat them as you would textual content: "
+    "Some blocks begin with \"[Figure on page N]:\" — these are OCR-extracted text "
+    "from images found on that document page. Treat them as you would textual content: "
     "cite the source file and page when referencing them, and flag any uncertainty if the "
-    "description seems ambiguous.\n\n"
-) if config.VISION_MODEL else ""
+    "extracted text seems garbled or incomplete.\n\n"
+) if config.OCR_ENABLED else ""
 
 _SYSTEM = """\
 You are Geo-Assist, a technical document Q&A assistant operating in a secure, \
@@ -359,8 +566,14 @@ For specific values, names, or numbers: quote or paraphrase the exact passage th
 supports the claim. If you cannot point to that passage, say "I cannot find that in \
 the retrieved text." Never fill the gap with a guess.
 
-If the retrieved text contains contradictions within the same document, flag them \
-explicitly rather than picking one silently.
+If the retrieved text contains contradictions — whether within a single document or \
+across different documents — flag them explicitly rather than picking one silently. \
+This matters most for boilerplate specs (weight limits, temperature ranges, voltages) \
+that appear in near-identical form across multiple manuals for different product \
+variants: if two or more retrieved blocks give different values for what looks like \
+the same fact, do not average, blend, or silently choose one. State that the value \
+differs by document, list each document with its value, and say which one (if any) \
+matches the specific product the question is about.
 
 When asked for a recommendation, derive it from measurements, test results, margins, \
 and findings in the retrieved blocks — not from a section labelled "Recommendations".
@@ -445,7 +658,7 @@ Output only the 3 queries, one per line, no numbering or explanation.\
 async def _expand_query(question: str) -> list[str]:
     try:
         raw = await llm.chat(system=_EXPAND_SYSTEM, user=question, model=config.EXPAND_MODEL)
-        variants = [q.strip() for q in raw.splitlines() if q.strip()][:2]
+        variants = [q.strip() for q in raw.splitlines() if q.strip()][:3]
     except Exception:
         log.warning("query expansion failed", exc_info=True)
         variants = []
@@ -592,7 +805,8 @@ def _inject_system_names(
                 named_doc_set.add(fetched["metadatas"][0].get("filename", ""))
         else:
             named_doc_set.add(sem_hits[summary_cid][1].get("filename", ""))
-        rrf_scores[summary_cid] = max(rrf_scores.get(summary_cid, 0.0), 1.0 / (_RRF_K + 1) * 2)
+        if summary_cid in sem_hits:
+            rrf_scores[summary_cid] = max(rrf_scores.get(summary_cid, 0.0), 1.0 / (_RRF_K + 1) * 2)
 
 
 async def _apply_comparison_boost(
@@ -617,7 +831,8 @@ async def _apply_comparison_boost(
             fetched = col.get(ids=[cid], include=["documents", "metadatas"])
             if fetched["ids"]:
                 sem_hits[cid] = (fetched["documents"][0], fetched["metadatas"][0], 991.0)
-        rrf_scores[cid] = max(rrf_scores.get(cid, 0.0), 1.0 / (_RRF_K + rank + 1) * 3)
+        if cid in sem_hits:
+            rrf_scores[cid] = max(rrf_scores.get(cid, 0.0), 1.0 / (_RRF_K + rank + 1) * 3)
     try:
         comp_sem_query = f"domain performance digest top performers highest {question}"
         comp_hits = await _semantic_search(col, comp_sem_query, config.RETRIEVAL_K, where=sem_where)
@@ -641,23 +856,10 @@ def _with_folder(where: dict | None, folder: str | None) -> dict | None:
     return {"$and": [where, folder_clause]}
 
 
-def _with_access(where: dict | None, current_user: dict | None) -> dict | None:
-    """Add access-control filter for non-admin users when auth is enabled."""
-    if not config.AUTH_ENABLED or not current_user:
-        return where
-    if current_user.get("role") == "admin":
-        return where
-    access_clause = {"$or": [{"access": "public"}, {"owner": current_user["username"]}]}
-    if not where:
-        return access_clause
-    return {"$and": [where, access_clause]}
-
-
 def _catalog_context(
     question: str,
     col,
     folder_filter: str | None,
-    current_user: dict | None,
 ) -> tuple[list[str], list[dict]] | None:
     """Catalog/inventory mode: first page chunks from every ingested document.
 
@@ -675,10 +877,7 @@ def _catalog_context(
         return None
 
     capped = docs[:15]
-    batch_where = _with_access(
-        _with_folder({"doc_id": {"$in": [d["doc_id"] for d in capped]}}, folder_filter),
-        current_user,
-    )
+    batch_where = _with_folder({"doc_id": {"$in": [d["doc_id"] for d in capped]}}, folder_filter)
     all_fetched = col.get(where=batch_where, include=["documents", "metadatas"])
 
     by_doc: dict[str, list[tuple]] = {}
@@ -718,24 +917,23 @@ def _catalog_context(
             key = (meta["doc_id"], meta["page"])
             if key not in seen:
                 seen.add(key)
-                sources.append({"filename": meta["filename"], "page": meta["page"]})
+                sources.append({"filename": meta["filename"], "page": meta["page"], "doc_id": meta["doc_id"]})
 
     return (context_parts, sources) if context_parts else None
 
 
-async def _retrieve(question: str, col, folder_filter: str | None = None,
-                    current_user: dict | None = None) -> tuple[str, list] | None:
+async def _retrieve(question: str, col, folder_filter: str | None = None) -> tuple[str, list] | None:
     """Run the full retrieval pipeline. Returns (system_prompt, sources) or None."""
     if bm25_index.size() == 0:
         bm25_index.load_or_rebuild(col)
 
     if _CATALOG_RE.search(question):
-        result = _catalog_context(question, col, folder_filter, current_user)
+        result = _catalog_context(question, col, folder_filter)
         if result:
             log.info("catalog mode: returning one chunk per document (%d docs)", len(result[1]))
             return result
 
-    sem_where = _with_access(_with_folder(None, folder_filter), current_user)
+    sem_where = _with_folder(None, folder_filter)
     total_chunks = col.count()
 
     if config.QUERY_EXPANSION:
@@ -800,6 +998,12 @@ async def _retrieve(question: str, col, folder_filter: str | None = None,
     if sys_names:
         _inject_system_names(sys_names, sem_hits, rrf_scores, named_doc_set, col)
 
+    if _COMPARISON_RE.search(question):
+        await _apply_comparison_boost(question, sem_hits, rrf_scores, col, folder_filter, sem_where)
+
+    # Structural boosts applied before pool selection so boosted chunks compete
+    # fairly for the top-N reranker slots. A summary or table chunk that would
+    # rank #21 without a boost might rank #8 with it, changing what the reranker sees.
     for cid in rrf_scores:
         if cid.endswith("_1_-1"):
             rrf_scores[cid] *= _SUMMARY_BOOST
@@ -809,17 +1013,45 @@ async def _retrieve(question: str, col, folder_filter: str | None = None,
             if cid in sem_hits and sem_hits[cid][1].get("table_id"):
                 rrf_scores[cid] *= 1.5
 
-    if _COMPARISON_RE.search(question):
-        await _apply_comparison_boost(question, sem_hits, rrf_scores, col, folder_filter, sem_where)
-
     if config.RERANK_ENABLED:
         top_n = sorted(rrf_scores, key=lambda x: -rrf_scores[x])[:config.RERANK_TOP_N]
         candidates = [(cid, sem_hits[cid][0]) for cid in top_n if cid in sem_hits]
         order = reranker.rerank(question, candidates)
+        reranked_cids = {candidates[i][0] for i in range(len(candidates))}
         for new_rank, orig_idx in enumerate(order):
             rrf_scores[candidates[orig_idx][0]] = 1.0 / (_RRF_K + new_rank + 1)
+        # Cap non-reranked chunks strictly below the worst reranked score so chunks
+        # the reranker never evaluated cannot outrank the reranker's top picks.
+        # Exempt force-injected chunks (sentinel distances) — they carry hard pipeline
+        # guarantees (named-doc, sys-name, comparison-boost) that must be preserved.
+        if candidates:
+            floor = 1.0 / (_RRF_K + len(candidates) + 1) * 0.5
+            for cid in rrf_scores:
+                if cid not in reranked_cids:
+                    dist = sem_hits.get(cid, (None, None, 0.0))[2]
+                    if dist not in _INJECTED_SENTINELS:
+                        rrf_scores[cid] = min(rrf_scores[cid], floor)
 
     top_ids = _diverse_top(rrf_scores, sem_hits, named_doc_set=named_doc_set)
+
+    # Product/document identity guarantee: a chunk deep in a manual (e.g. a page-24
+    # safety warning) often never restates the document's title or product name, so
+    # the model can't verify which product a fact belongs to and will (correctly,
+    # per its own grounding rules) refuse to attribute it. Inject each document's
+    # synthesized summary chunk (always {doc_id}_1_-1, see ingest.py) for every
+    # document represented in context, not just explicitly-named ones — generalizes
+    # the guarantee _inject_named_docs already gives named documents.
+    docs_in_context = {sem_hits[cid][1]["doc_id"] for cid in top_ids}
+    docs_with_summary = {sem_hits[cid][1]["doc_id"] for cid in top_ids if cid.endswith("_1_-1")}
+    missing_summary_docs = docs_in_context - docs_with_summary
+    if missing_summary_docs:
+        summary_ids = [f"{did}_1_-1" for did in missing_summary_docs]
+        s_result = col.get(ids=summary_ids, include=["documents", "metadatas"])
+        for cid, doc, meta in zip(s_result["ids"], s_result["documents"], s_result["metadatas"]):
+            if cid not in sem_hits:
+                sem_hits[cid] = (doc, meta, 993.0)
+            if cid not in top_ids:
+                top_ids.append(cid)
 
     # Table completeness: if any top chunk is tagged as part of a table, pull in
     # every chunk from that same table so the model always sees the full table.
@@ -909,7 +1141,7 @@ async def _retrieve(question: str, col, folder_filter: str | None = None,
         key = (meta["doc_id"], meta["page"])
         if key not in seen:
             seen.add(key)
-            sources.append({"filename": meta["filename"], "page": meta["page"]})
+            sources.append({"filename": meta["filename"], "page": meta["page"], "doc_id": meta["doc_id"]})
 
     return context_parts, sources
 
@@ -964,13 +1196,11 @@ def _build_system(context_parts: list[str], procedure: dict | None) -> str:
 
 
 async def answer(question: str, history: list[dict] | None = None,
-                 folder_filter: str | None = None, current_user: dict | None = None,
-                 procedure: dict | None = None) -> dict:
+                 folder_filter: str | None = None, procedure: dict | None = None) -> dict:
     col = ingest._db()
     if col.count() == 0:
         return {"answer": _NOT_FOUND, "sources": []}
-    result = await _retrieve(_retrieval_query(question, history), col,
-                             folder_filter=folder_filter, current_user=current_user)
+    result = await _retrieve(_retrieval_query(question, history), col, folder_filter=folder_filter)
     if result is None:
         return {"answer": _NOT_FOUND, "sources": []}
     context_parts, sources = result
@@ -980,8 +1210,7 @@ async def answer(question: str, history: list[dict] | None = None,
 
 
 async def answer_stream(question: str, history: list[dict] | None = None,
-                        folder_filter: str | None = None, current_user: dict | None = None,
-                        procedure: dict | None = None):
+                        folder_filter: str | None = None, procedure: dict | None = None):
     """Async generator: yields {token} dicts then a final {sources, done} dict."""
     col = ingest._db()
     if col.count() == 0:
@@ -991,12 +1220,11 @@ async def answer_stream(question: str, history: list[dict] | None = None,
 
     # Catalog queries bypass normal RAG — extract per-document and stream row by row.
     if _CATALOG_RE.search(question) and not procedure:
-        async for chunk in _catalog_stream(question, col, folder_filter, current_user):
+        async for chunk in _catalog_stream(question, col, folder_filter):
             yield chunk
         return
 
-    result = await _retrieve(_retrieval_query(question, history), col,
-                             folder_filter=folder_filter, current_user=current_user)
+    result = await _retrieve(_retrieval_query(question, history), col, folder_filter=folder_filter)
     if result is None:
         yield {"token": _NOT_FOUND}
         yield {"sources": [], "done": True}
