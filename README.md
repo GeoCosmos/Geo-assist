@@ -4,7 +4,13 @@ A fully local, air-gapped document Q&A assistant. Upload engineering documents a
 
 ## Prerequisites
 
-**Ollama** must be installed and running. Pull the required models:
+**Ollama** must be installed and running. 
+
+```bash
+irm https://ollama.com/install.ps1 | iex
+```
+
+Pull the required models:
 
 ```bash
 ollama pull nomic-embed-text
@@ -16,6 +22,12 @@ ollama pull qwen3.5:4b      # default chat model
 ```bash
 pip install -r requirements.txt
 ```
+
+Windows Visual Studio C++ download:
+1. open https://visualstudio.microsoft.com/downloads/
+2. Click on the free download version
+3. During set-up, check the C++ for desktop module
+4. Restart computer
 
 ## Starting
 
