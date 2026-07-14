@@ -59,12 +59,13 @@ call sites.
 
 `start.bat` calls `start.ps1` which:
 1. Detects CPU cores and NVIDIA GPU
-2. Sets `OLLAMA_NUM_THREADS`, `OLLAMA_NUM_GPU`, concurrency tuning per hardware
-3. Sets `OLLAMA_MAX_LOADED_MODELS=2` — keeps both chat and embed models resident simultaneously (prevents 30s cold-load latency on first query)
-4. Verifies / pulls required Ollama models
-5. Installs Python deps
-6. Starts uvicorn with `--loop asyncio --workers 1`
-7. Opens browser when ready
+2. Checks for Ollama and Visual Studio Build Tools (C++ workload); offers to install either via winget if missing (see "Prerequisite auto-install pattern" below)
+3. Sets `OLLAMA_NUM_THREADS`, `OLLAMA_NUM_GPU`, concurrency tuning per hardware
+4. Sets `OLLAMA_MAX_LOADED_MODELS=2` — keeps both chat and embed models resident simultaneously (prevents 30s cold-load latency on first query)
+5. Verifies / pulls required Ollama models
+6. Installs Python deps
+7. Starts uvicorn with `--loop asyncio --workers 1`
+8. Opens browser when ready
 
 Override any setting before running:
 ```powershell
@@ -72,13 +73,37 @@ $env:GEO_CHAT_MODEL = "qwen3.5:4b"
 .\start.ps1
 ```
 
-### macOS / Linux (dev only)
+### macOS
+
+```bash
+./start_mac.sh
+```
+
+Mirrors `start.ps1`'s behavior: detects hardware, checks for Ollama (offers `brew install ollama`) and Xcode Command Line Tools (offers `xcode-select --install`), pulls models, installs Python deps, starts uvicorn, opens the browser.
+
+### Linux
+
+```bash
+./start_linux.sh
+```
+
+Mirrors the same behavior: detects hardware and GPU (`nvidia-smi`), checks for Ollama (offers the official install script) and a C compiler (offers an `apt`/`dnf` build-tools install), pulls models, installs Python deps, starts uvicorn, opens the browser via `xdg-open`.
+
+### Prerequisite auto-install pattern
+
+All three start scripts (`start.ps1`, `start_mac.sh`, `start_linux.sh`) follow the same shape when a prerequisite is missing: print what's missing and why it's needed, ask the user to confirm (`y/N`) before installing anything, then use the platform's native package manager (winget / brew / apt-dnf, or Ollama's own installer script). If the user declines, the script prints manual install instructions and either exits (Ollama — required) or continues with a warning (C compiler — optional; `pip install` may fail later without it). Follow this pattern if extending these scripts further — don't reintroduce silent or unconditional installs.
+
+### Manual run (any OS, dev only)
 
 ```bash
 ollama pull qwen3.5:4b && ollama pull nomic-embed-text
 pip3 install -r requirements.txt
 GEO_CHAT_MODEL=qwen3.5:4b python3 -m uvicorn main:app --host 127.0.0.1 --port 8743
 ```
+
+## Releases
+
+Pushing a tag matching `v*` (e.g. `git tag v1.1.0 && git push origin v1.1.0`) triggers `.github/workflows/release.yml`, which zips the repo three times via `git archive` (identical content, one zip per OS label) and publishes them to a GitHub Release. All three zips ship all three start scripts — the filename is what tells the user which one is theirs.
 
 ### OCR support (optional)
 
