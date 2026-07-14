@@ -111,7 +111,23 @@ catch {
     exit 1
 }
 
-# ── check Ollama ──────────────────────────────────────────────────────────────
+# ── check Ollama installed ──────────────────────────────────────────────────────
+$OllamaInstalled = [bool](Get-Command "ollama" -ErrorAction SilentlyContinue)
+if (-not $OllamaInstalled) {
+    Write-Host "  [--] Ollama not found." -ForegroundColor Yellow
+    $Resp = Read-Host "      Install Ollama now via winget? (~200 MB) [y/N]"
+    if ($Resp -match '^[Yy]') {
+        winget install --id Ollama.Ollama --silent --accept-package-agreements --accept-source-agreements
+        Write-Host "      Ollama installed. It may need a moment to start its background service." -ForegroundColor Cyan
+        Start-Sleep -Seconds 5
+    } else {
+        Write-Host "ERROR: Ollama is required. Install manually: https://ollama.com/download/windows" -ForegroundColor Red
+        Read-Host "`nPress Enter to exit"
+        exit 1
+    }
+}
+
+# ── check Ollama running ────────────────────────────────────────────────────────
 try { Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags" -TimeoutSec 3 | Out-Null }
 catch {
     Write-Host "ERROR: Ollama is not running." -ForegroundColor Red
@@ -120,6 +136,30 @@ catch {
     Read-Host "`nPress Enter to exit"
     exit 1
 }
+
+# ── check C++ Build Tools (needed for native pip extensions) ────────────────────
+function Test-VCBuildTools {
+    $VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $VsWhere)) { return $false }
+    $Installed = & $VsWhere -latest -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath
+    return [bool]$Installed
+}
+
+if (-not (Test-VCBuildTools)) {
+    Write-Host "  [--] C++ Build Tools not found (needed to compile some Python packages)." -ForegroundColor Yellow
+    $Resp = Read-Host "      Install Visual Studio Build Tools now via winget? This is a 1-2 GB download and can take several minutes. [y/N]"
+    if ($Resp -match '^[Yy]') {
+        winget install --id Microsoft.VisualStudio.2022.BuildTools --silent --accept-package-agreements --accept-source-agreements --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+        Write-Host "      Build Tools installed." -ForegroundColor Green
+    } else {
+        Write-Host "      Skipping. pip install may fail without a compiler." -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "  [OK] C++ Build Tools found" -ForegroundColor Green
+}
+Write-Host ""
 
 # ── verify / pull required models ─────────────────────────────────────────────
 function Confirm-OllamaModel {

@@ -2,14 +2,33 @@
 
 A fully local, air-gapped document Q&A assistant. Upload engineering documents and ask plain-English questions. All inference runs on your machine via Ollama — no cloud, no telemetry, nothing leaves the device.
 
+## Download
+
+Grab the latest release for your OS from the [Releases page](../../releases):
+
+| OS | What to do |
+|---|---|
+| Windows | Download `geo-assist-windows-*.zip`, unzip, double-click `start.bat` |
+| macOS | Download `geo-assist-macos-*.zip`, unzip, run `./start_mac.sh` |
+| Linux | Download `geo-assist-linux-*.zip`, unzip, run `./start_linux.sh` |
+
+Each script checks for Ollama and a C compiler (needed to build a few Python packages), offers to install anything missing, pulls the required models, installs Python dependencies, and opens the app in your browser. The rest of this README explains what's happening under the hood, and how to do any of it by hand.
+
 ## Prerequisites
 
-**Ollama** must be installed and running. Pull the required models:
+The start script for your OS checks for these and offers to install them — you normally don't need to do this yourself. Manual install, if you'd rather:
+
+**Ollama** — https://ollama.com/download, then pull the required models:
 
 ```bash
 ollama pull nomic-embed-text
 ollama pull qwen3.5:4b      # default chat model
 ```
+
+**A C compiler** — needed because `chromadb`, `sentence-transformers`, and `easyocr` may build native extensions if no prebuilt wheel matches your Python version.
+- Windows: Visual Studio Build Tools (C++ workload)
+- macOS: Xcode Command Line Tools (`xcode-select --install`)
+- Linux: `build-essential` (apt) or `gcc` + `python3-devel` (dnf)
 
 **Python 3.11+** with dependencies:
 
@@ -19,11 +38,11 @@ pip install -r requirements.txt
 
 ## Starting
 
-### Windows (primary)
+### Windows
 
 Double-click `start.bat`, or right-click → Run with PowerShell.
 
-`start.ps1` auto-detects your CPU core count and NVIDIA GPU, sets Ollama thread/GPU parameters accordingly, verifies models are pulled, installs Python dependencies, and opens the browser when ready.
+`start.ps1` auto-detects your CPU core count and NVIDIA GPU, checks for Ollama and C++ Build Tools (offering to install either via winget if missing), sets Ollama thread/GPU parameters accordingly, verifies models are pulled, installs Python dependencies, and opens the browser when ready.
 
 To override settings before launching:
 
@@ -32,7 +51,29 @@ $env:GEO_CHAT_MODEL   = "qwen3.5:4b"
 .\start.ps1
 ```
 
-### macOS / Linux
+### macOS
+
+```bash
+./start_mac.sh
+```
+
+`start_mac.sh` checks for Ollama (offering `brew install ollama` if missing) and Xcode Command Line Tools, verifies models are pulled, installs Python dependencies, and opens the browser when ready.
+
+Or run it manually:
+
+```bash
+GEO_CHAT_MODEL=qwen3.5:4b python3 -m uvicorn main:app --host 127.0.0.1 --port 8743
+```
+
+### Linux
+
+```bash
+./start_linux.sh
+```
+
+`start_linux.sh` checks for Ollama (offering the official install script if missing) and a C compiler (offering an apt/dnf install if missing), verifies models are pulled, installs Python dependencies, and opens the browser when ready.
+
+Or run it manually:
 
 ```bash
 GEO_CHAT_MODEL=qwen3.5:4b python3 -m uvicorn main:app --host 127.0.0.1 --port 8743
