@@ -23,7 +23,7 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           for OS in windows macos linux; do
-            git archive --format=zip --output="geo-assist-${OS}-${VERSION}.zip" HEAD
+            git archive --format=zip --prefix="geo-assist-${VERSION}/" --output="geo-assist-${OS}-${VERSION}.zip" HEAD
           done
 
       - name: Create GitHub Release

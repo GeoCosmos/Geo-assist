@@ -121,7 +121,10 @@ echo ""
 
 # -- install python deps ---------------------------------------------------------------
 echo "Checking Python dependencies..."
-python3 -m pip install -r requirements.txt -q
+if ! python3 -m pip install -r requirements.txt -q; then
+    echo "ERROR: pip install failed. Check requirements.txt and your Python version."
+    exit 1
+fi
 echo "  Dependencies OK"
 echo ""
 
