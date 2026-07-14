@@ -36,6 +36,12 @@ ollama pull qwen3.5:4b      # default chat model
 pip install -r requirements.txt
 ```
 
+Windows Visual Studio C++ download:
+1. open https://visualstudio.microsoft.com/downloads/
+2. Click on the free download version
+3. During set-up, check the C++ for desktop module
+4. Restart computer
+
 ## Starting
 
 ### Windows
