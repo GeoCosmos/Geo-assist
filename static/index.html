@@ -1066,6 +1066,16 @@ async function _readDirEntry(dirEntry) {
 async function uploadFiles(files) {
   if (!files.length) return;
   if (_ingestLocked) { showToast('Upload already in progress — please wait', true); return; }
+
+  // Lock and show the bar immediately — before the upload request, not after —
+  // so a second drop/select during a slow upload can't race in and start a
+  // second job. Two jobs polling concurrently both write to the same shared
+  // fill/bar elements, which made the bar appear to jump back to 0% at random.
+  setIngestLock(true);
+  bar.style.display = 'block';
+  fill.style.width = '0%';
+  setIngestLabel('Uploading…');
+
   const folder = (document.getElementById('folder-input').value || 'General').trim();
   const form = new FormData();
   files.forEach(f => form.append('files', f));
@@ -1075,16 +1085,21 @@ async function uploadFiles(files) {
   try {
     const r = await _apiFetch(`${API}/ingest/bulk`, { method: 'POST', body: form });
     job = await r.json();
-    if (!r.ok) { showToast(job.detail || 'Upload failed', true); return; }
+    if (!r.ok) {
+      showToast(job.detail || 'Upload failed', true);
+      setIngestLock(false);
+      bar.style.display = 'none'; fill.style.width = '0%'; setIngestLabel('');
+      return;
+    }
   } catch {
     showToast('Upload failed — backend unreachable', true);
+    setIngestLock(false);
+    bar.style.display = 'none'; fill.style.width = '0%'; setIngestLabel('');
     return;
   }
 
   input.value = '';
-  bar.style.display = 'block';
   fill.style.width = '0%';
-  setIngestLock(true);
   setIngestLabel(`Processing 0 / ${job.total}…`);
   pollJob(job.job_id, job.total);
 }
