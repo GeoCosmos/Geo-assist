@@ -103,7 +103,12 @@ GEO_CHAT_MODEL=qwen3.5:4b python3 -m uvicorn main:app --host 127.0.0.1 --port 87
 
 ## Releases
 
-Pushing a tag matching `v*` (e.g. `git tag v1.1.0 && git push origin v1.1.0`) triggers `.github/workflows/release.yml`, which zips the repo three times via `git archive` (identical content, one zip per OS label) and publishes them to a GitHub Release. All three zips ship all three start scripts — the filename is what tells the user which one is theirs.
+Pushing a tag matching `v*` (e.g. `git tag v1.1.0 && git push origin v1.1.0`) triggers `.github/workflows/release.yml`, which zips the repo three times via `git archive` and publishes them to a GitHub Release. Each zip is trimmed to runtime-only files via `git archive` pathspec excludes (`:(exclude)path`):
+
+- `COMMON_EXCLUDES` drops dev-only paths from all three zips — `tests/`, `docs/`, `.github/`, `CLAUDE.md`, `pytest.ini`, `.gitignore`, `backfill_summaries.py` (a one-off migration script, not part of the app).
+- Per-OS excludes drop the other OSes' start scripts — `geo-assist-windows-*.zip` ships only `start.bat`/`start.ps1`, `geo-assist-macos-*.zip` only `start_mac.sh`, `geo-assist-linux-*.zip` only `start_linux.sh`.
+
+Anyone needing the full source (including tests/docs) should use GitHub's automatic per-tag "Source code (zip/tar.gz)" links, which always ship everything — no workflow change needed for that. Add new dev-only or OS-specific files to the relevant exclude list in the workflow to keep them out of the runtime zips.
 
 ### OCR support (optional)
 

@@ -22,8 +22,21 @@ jobs:
       - name: Build release archives
         run: |
           VERSION="${{ steps.version.outputs.version }}"
+          # Dev-only paths, irrelevant to running the app. Full source (incl.
+          # tests/docs) is always available via GitHub's automatic per-tag
+          # "Source code" archive, so nothing is lost by trimming these here.
+          COMMON_EXCLUDES="tests docs .github CLAUDE.md pytest.ini .gitignore backfill_summaries.py"
           for OS in windows macos linux; do
-            git archive --format=zip --prefix="geo-assist-${VERSION}/" --output="geo-assist-${OS}-${VERSION}.zip" HEAD
+            case "$OS" in
+              windows) OS_EXCLUDES="start_mac.sh start_linux.sh" ;;
+              macos)   OS_EXCLUDES="start.bat start.ps1 start_linux.sh" ;;
+              linux)   OS_EXCLUDES="start.bat start.ps1 start_mac.sh" ;;
+            esac
+            PATHSPECS=(".")
+            for FILE in $COMMON_EXCLUDES $OS_EXCLUDES; do
+              PATHSPECS+=(":(exclude)${FILE}")
+            done
+            git archive --format=zip --prefix="geo-assist-${VERSION}/" --output="geo-assist-${OS}-${VERSION}.zip" HEAD -- "${PATHSPECS[@]}"
           done
 
       - name: Create GitHub Release
