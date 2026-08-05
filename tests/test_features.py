@@ -10,7 +10,6 @@ Features covered:
   7. Cross-encoder re-ranking (reranker.rerank)
 """
 import re
-import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -24,6 +23,7 @@ import retriever
 @pytest.mark.asyncio
 async def test_api_still_rejects_binary_exe(mock_ollama):
     from fastapi.testclient import TestClient
+
     import main
     client = TestClient(main.app)
     r = client.post("/ingest", files={"file": ("virus.exe", b"MZ\x90\x00", "application/octet-stream")})
@@ -33,6 +33,7 @@ async def test_api_still_rejects_binary_exe(mock_ollama):
 @pytest.mark.asyncio
 async def test_api_still_rejects_png(mock_ollama):
     from fastapi.testclient import TestClient
+
     import main
     client = TestClient(main.app)
     r = client.post("/ingest", files={"file": ("photo.png", b"\x89PNG", "image/png")})
@@ -85,7 +86,7 @@ async def test_list_folders_sorted_and_unique(mock_ollama):
     await ingest.ingest(b"HR doc.", "hr.txt", folder="HR")
     await ingest.ingest(b"Finance doc.", "fin.txt", folder="Finance")
     await ingest.ingest(b"Another HR doc.", "hr2.txt", folder="HR")
-    folders = ingest.list_folders()
+    folders = await ingest.list_folders()
     assert folders.count("HR") == 1
     assert "Finance" in folders
     assert folders == sorted(folders)
@@ -93,7 +94,7 @@ async def test_list_folders_sorted_and_unique(mock_ollama):
 
 @pytest.mark.asyncio
 async def test_list_folders_empty_when_no_docs():
-    assert ingest.list_folders() == []
+    assert await ingest.list_folders() == []
 
 
 @pytest.mark.asyncio
@@ -101,17 +102,17 @@ async def test_move_document_changes_folder(mock_ollama):
     result = await ingest.ingest(b"Moveable content here.", "move.txt", folder="Source")
     doc_id = result["doc_id"]
 
-    moved = ingest.move_document(doc_id, "Destination")
+    moved = await ingest.move_document(doc_id, "Destination")
     assert moved > 0
 
-    docs = ingest.list_documents()
+    docs = await ingest.list_documents()
     doc = next(d for d in docs if d["doc_id"] == doc_id)
     assert doc["folder"] == "Destination"
 
 
 @pytest.mark.asyncio
 async def test_move_document_nonexistent_returns_zero():
-    assert ingest.move_document("deadbeef12345678", "AnyFolder") == 0
+    assert await ingest.move_document("deadbeef12345678", "AnyFolder") == 0
 
 
 @pytest.mark.asyncio
@@ -119,7 +120,7 @@ async def test_move_document_rebuilds_bm25(mock_ollama):
     result = await ingest.ingest(b"BM25 folder test content.", "bm25test.txt", folder="OldF")
     doc_id = result["doc_id"]
     old_size = bm25_index._index.size
-    ingest.move_document(doc_id, "NewF")
+    await ingest.move_document(doc_id, "NewF")
     # BM25 should be rebuilt — size unchanged but folder mapping updated
     assert bm25_index._index.size == old_size
     assert "NewF" in bm25_index._index._folders.values()
@@ -128,7 +129,7 @@ async def test_move_document_rebuilds_bm25(mock_ollama):
 @pytest.mark.asyncio
 async def test_list_documents_includes_folder(mock_ollama):
     await ingest.ingest(b"Sensitive report.", "secret.txt", folder="Confidential")
-    docs = ingest.list_documents()
+    docs = await ingest.list_documents()
     doc = next(d for d in docs if d["filename"] == "secret.txt")
     assert doc["folder"] == "Confidential"
 
@@ -136,6 +137,7 @@ async def test_list_documents_includes_folder(mock_ollama):
 @pytest.mark.asyncio
 async def test_api_ingest_with_folder_form_field(mock_ollama):
     from fastapi.testclient import TestClient
+
     import main
     client = TestClient(main.app)
     r = client.post(
@@ -150,6 +152,7 @@ async def test_api_ingest_with_folder_form_field(mock_ollama):
 @pytest.mark.asyncio
 async def test_api_folders_endpoint(mock_ollama):
     from fastapi.testclient import TestClient
+
     import main
     client = TestClient(main.app)
     client.post(
@@ -172,6 +175,7 @@ async def test_api_folders_endpoint(mock_ollama):
 @pytest.mark.asyncio
 async def test_api_folders_endpoint_empty():
     from fastapi.testclient import TestClient
+
     import main
     client = TestClient(main.app)
     r = client.get("/folders")
@@ -182,6 +186,7 @@ async def test_api_folders_endpoint_empty():
 @pytest.mark.asyncio
 async def test_api_move_document_folder(mock_ollama):
     from fastapi.testclient import TestClient
+
     import main
     client = TestClient(main.app)
     r = client.post(
@@ -200,6 +205,7 @@ async def test_api_move_document_folder(mock_ollama):
 @pytest.mark.asyncio
 async def test_api_move_document_nonexistent_returns_404(mock_ollama):
     from fastapi.testclient import TestClient
+
     import main
     client = TestClient(main.app)
     r = client.patch("/documents/deadbeef00000000/folder", json={"folder": "Anywhere"})
@@ -421,20 +427,26 @@ def test_with_folder_empty_string_returns_where_unchanged():
 
 def test_with_folder_no_existing_where_returns_simple_clause():
     result = retriever._with_folder(None, "Engineering")
-    assert result == {"folder": "Engineering"}
+    assert result == {"operator": "==", "field": "meta.folder", "value": "Engineering"}
 
 
 def test_with_folder_with_existing_where_builds_and_clause():
-    where = {"access": "public"}
+    where = {"operator": "==", "field": "meta.access", "value": "public"}
     result = retriever._with_folder(where, "HR")
-    assert result == {"$and": [{"access": "public"}, {"folder": "HR"}]}
+    assert result == {
+        "operator": "AND",
+        "conditions": [where, {"operator": "==", "field": "meta.folder", "value": "HR"}],
+    }
 
 
 def test_with_folder_nested_correctly():
-    where = {"$or": [{"access": "public"}, {"owner": "alice"}]}
+    where = {"operator": "OR", "conditions": [
+        {"operator": "==", "field": "meta.access", "value": "public"},
+        {"operator": "==", "field": "meta.owner", "value": "alice"},
+    ]}
     result = retriever._with_folder(where, "Finance")
-    assert result["$and"][0] == where
-    assert result["$and"][1] == {"folder": "Finance"}
+    assert result["conditions"][0] == where
+    assert result["conditions"][1] == {"operator": "==", "field": "meta.folder", "value": "Finance"}
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -472,6 +484,7 @@ def test_safe_folder_normal_name_unchanged():
 @pytest.mark.asyncio
 async def test_api_empty_folder_stored_as_general(mock_ollama):
     from fastapi.testclient import TestClient
+
     import main
     client = TestClient(main.app)
     r = client.post(
@@ -486,6 +499,7 @@ async def test_api_empty_folder_stored_as_general(mock_ollama):
 @pytest.mark.asyncio
 async def test_api_whitespace_folder_stored_as_general(mock_ollama):
     from fastapi.testclient import TestClient
+
     import main
     client = TestClient(main.app)
     r = client.post(
@@ -500,6 +514,7 @@ async def test_api_whitespace_folder_stored_as_general(mock_ollama):
 @pytest.mark.asyncio
 async def test_api_long_folder_name_truncated(mock_ollama):
     from fastapi.testclient import TestClient
+
     import main
     client = TestClient(main.app)
     r = client.post(
@@ -514,6 +529,7 @@ async def test_api_long_folder_name_truncated(mock_ollama):
 @pytest.mark.asyncio
 async def test_api_move_document_empty_folder_defaults_to_general(mock_ollama):
     from fastapi.testclient import TestClient
+
     import main
     client = TestClient(main.app)
     r = client.post("/ingest", files={"file": ("mv.txt", b"data", "text/plain")})
@@ -651,53 +667,73 @@ def _fake_doc_cache(*filenames):
     ]
 
 
-def test_find_named_docs_empty_doc_list(monkeypatch):
+@pytest.mark.asyncio
+async def test_find_named_docs_empty_doc_list(monkeypatch):
     monkeypatch.setattr(ingest, "_doc_cache", [])
-    assert retriever._find_named_docs("What does Manual.pdf say?") == []
+    assert await retriever._find_named_docs("What does Manual.pdf say?") == []
 
 
-def test_find_named_docs_matches_full_filename(monkeypatch):
+@pytest.mark.asyncio
+async def test_find_named_docs_matches_full_filename(monkeypatch):
     monkeypatch.setattr(ingest, "_doc_cache", _fake_doc_cache("Manual.pdf"))
-    result = retriever._find_named_docs("what does Manual.pdf say about torque?")
+    result = await retriever._find_named_docs("what does Manual.pdf say about torque?")
     assert result == ["Manual.pdf"]
 
 
-def test_find_named_docs_matches_stem(monkeypatch):
+@pytest.mark.asyncio
+async def test_find_named_docs_matches_stem(monkeypatch):
     monkeypatch.setattr(ingest, "_doc_cache", _fake_doc_cache("ThrusterSpec.docx"))
-    result = retriever._find_named_docs("according to ThrusterSpec what is the thrust level?")
+    result = await retriever._find_named_docs("according to ThrusterSpec what is the thrust level?")
     assert result == ["ThrusterSpec.docx"]
 
 
-def test_find_named_docs_is_case_insensitive(monkeypatch):
+@pytest.mark.asyncio
+async def test_find_named_docs_is_case_insensitive(monkeypatch):
     monkeypatch.setattr(ingest, "_doc_cache", _fake_doc_cache("MANUAL.PDF"))
-    result = retriever._find_named_docs("what does manual.pdf say?")
+    result = await retriever._find_named_docs("what does manual.pdf say?")
     assert result == ["MANUAL.PDF"]
 
 
-def test_find_named_docs_short_stem_not_matched(monkeypatch):
-    # stem "ab" is 2 chars — below the 4-char minimum to avoid incidental matches
+@pytest.mark.asyncio
+async def test_find_named_docs_short_stem_not_matched(monkeypatch):
+    # stem "ab" is far below the minimum length for an incidental-match guard
     monkeypatch.setattr(ingest, "_doc_cache", _fake_doc_cache("AB.txt"))
-    result = retriever._find_named_docs("what is ab anyway?")
+    result = await retriever._find_named_docs("what is ab anyway?")
     assert result == []
 
 
-def test_find_named_docs_four_char_stem_is_matched(monkeypatch):
-    # stem "spec" is exactly 4 chars — should match
-    monkeypatch.setattr(ingest, "_doc_cache", _fake_doc_cache("spec.pdf"))
-    result = retriever._find_named_docs("what does spec say about the system?")
-    assert result == ["spec.pdf"]
+@pytest.mark.asyncio
+async def test_find_named_docs_generic_short_stem_not_matched(monkeypatch):
+    """A generically-named file must not hijack the context window.
+
+    A matched document is granted every context slot by _diverse_top, so a loose
+    match is expensive. `spec.pdf` used to match any question containing the word
+    "spec" under the old 4-character substring rule.
+    """
+    monkeypatch.setattr(ingest, "_doc_cache", _fake_doc_cache("spec.pdf", "data.pdf"))
+    assert await retriever._find_named_docs("what does the spec say about data?") == []
 
 
-def test_find_named_docs_no_match_returns_empty(monkeypatch):
+@pytest.mark.asyncio
+async def test_find_named_docs_requires_word_boundary(monkeypatch):
+    """A stem embedded inside a longer word is not a reference to that document."""
+    monkeypatch.setattr(ingest, "_doc_cache", _fake_doc_cache("thruster.pdf"))
+    assert await retriever._find_named_docs("tell me about thrusters generally") == []
+    assert await retriever._find_named_docs("what does thruster say?") == ["thruster.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_find_named_docs_no_match_returns_empty(monkeypatch):
     monkeypatch.setattr(ingest, "_doc_cache", _fake_doc_cache("ThrusterSpec.pdf"))
-    result = retriever._find_named_docs("what is the GPA of the student?")
+    result = await retriever._find_named_docs("what is the GPA of the student?")
     assert result == []
 
 
-def test_find_named_docs_returns_multiple_matches(monkeypatch):
+@pytest.mark.asyncio
+async def test_find_named_docs_returns_multiple_matches(monkeypatch):
     monkeypatch.setattr(ingest, "_doc_cache",
                         _fake_doc_cache("Alpha.txt", "Beta.txt", "Gamma.txt"))
-    result = retriever._find_named_docs("compare Alpha.txt and Beta.txt")
+    result = await retriever._find_named_docs("compare Alpha.txt and Beta.txt")
     assert set(result) == {"Alpha.txt", "Beta.txt"}
     assert "Gamma.txt" not in result
 

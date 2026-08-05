@@ -1,10 +1,12 @@
 """Tests for document parsing and chunking."""
 from unittest.mock import MagicMock, patch
+
 import pytest
+
 import bm25_index
 import config
 import ingest
-
+import store
 
 # ── text extraction ───────────────────────────────────────────────────────────
 
@@ -278,7 +280,7 @@ async def test_ingest_idempotent(mock_ollama):
     r2 = await ingest.ingest(data, "doc.txt")
     assert r1["doc_id"] == r2["doc_id"]
     # Should not double-store; chunk count stays the same
-    docs = ingest.list_documents()
+    docs = await ingest.list_documents()
     assert sum(d["doc_id"] == r1["doc_id"] for d in docs) == 1
 
 
@@ -292,7 +294,7 @@ async def test_ingest_empty_file(mock_ollama):
 async def test_list_documents(mock_ollama):
     await ingest.ingest(b"Document one.", "a.txt")
     await ingest.ingest(b"Document two.", "b.txt")
-    docs = ingest.list_documents()
+    docs = await ingest.list_documents()
     names = {d["filename"] for d in docs}
     assert "a.txt" in names
     assert "b.txt" in names
@@ -302,33 +304,33 @@ async def test_list_documents(mock_ollama):
 async def test_delete_document(mock_ollama):
     result = await ingest.ingest(b"To be deleted.", "del.txt")
     doc_id = result["doc_id"]
-    removed = ingest.delete_document(doc_id)
+    removed = await ingest.delete_document(doc_id)
     assert removed > 0
-    docs = ingest.list_documents()
+    docs = await ingest.list_documents()
     assert not any(d["doc_id"] == doc_id for d in docs)
 
 
 @pytest.mark.asyncio
 async def test_delete_nonexistent_returns_zero():
-    removed = ingest.delete_document("deadbeef12345678")
+    removed = await ingest.delete_document("deadbeef12345678")
     assert removed == 0
 
 
 @pytest.mark.asyncio
 async def test_clear_all_empty_returns_zero():
-    assert ingest.clear_all_documents() == 0
+    assert await ingest.clear_all_documents() == 0
 
 
 @pytest.mark.asyncio
 async def test_clear_all_removes_all_documents(mock_ollama):
     await ingest.ingest(b"Document Alpha content.", "alpha.txt")
     await ingest.ingest(b"Document Beta content.", "beta.txt")
-    assert ingest._db().count() > 0
+    assert await store.count() > 0
 
-    removed = ingest.clear_all_documents()
+    removed = await ingest.clear_all_documents()
     assert removed > 0
-    assert ingest._db().count() == 0
-    assert ingest.list_documents() == []
+    assert await store.count() == 0
+    assert await ingest.list_documents() == []
 
 
 @pytest.mark.asyncio
@@ -336,7 +338,7 @@ async def test_clear_all_rebuilds_bm25_as_empty(mock_ollama):
     await ingest.ingest(b"Unique token XYZZY_CLEAR_TEST appears here.", "clear_test.txt")
     assert bm25_index.size() > 0
 
-    ingest.clear_all_documents()
+    await ingest.clear_all_documents()
     assert bm25_index.size() == 0
 
 
@@ -368,21 +370,47 @@ async def test_ingest_many_partial_empty(mock_ollama):
 
 
 @pytest.mark.asyncio
-async def test_ingest_many_bm25_rebuilt_once(mock_ollama, monkeypatch):
-    rebuild_calls = []
-    original = bm25_index.rebuild
-    monkeypatch.setattr(bm25_index, "rebuild", lambda col: rebuild_calls.append(1) or original(col))
+async def test_ingest_many_commits_bm25_once_per_flush(mock_ollama, monkeypatch):
+    """A batch must not re-fit BM25 once per file.
+
+    The old implementation called a full rebuild after every write, which is
+    O(files × corpus) and was the dominant cost of bulk ingest.
+    """
+    commits = []
+    original = bm25_index.commit
+    monkeypatch.setattr(
+        bm25_index, "commit",
+        lambda persist=True: commits.append(1) or original(persist),
+    )
 
     files = [(f"document {i} content".encode(), f"doc{i}.txt") for i in range(4)]
     await ingest.ingest_many(files)
-    assert len(rebuild_calls) == 1
+    assert len(commits) == 1, "expected a single commit for a batch under the flush threshold"
+
+
+@pytest.mark.asyncio
+async def test_ingest_many_survives_one_bad_file(mock_ollama, monkeypatch):
+    """One unparseable file must not discard the whole batch."""
+    real_worker = ingest._parse_worker
+
+    def flaky(path, filename, doc_id):
+        if filename == "bad.txt":
+            raise ValueError("corrupt file")
+        return real_worker(path, filename, doc_id)
+
+    monkeypatch.setattr(ingest, "_parse_worker", flaky)
+
+    files = [(b"good one.", "good1.txt"), (b"bad.", "bad.txt"), (b"good two.", "good2.txt")]
+    results = await ingest.ingest_many(files)
+    names = {r["filename"] for r in results}
+    assert names == {"good1.txt", "good2.txt"}
 
 
 @pytest.mark.asyncio
 async def test_ingest_many_all_stored(mock_ollama):
     files = [(b"Content alpha.", "alpha.txt"), (b"Content beta.", "beta.txt")]
     await ingest.ingest_many(files)
-    docs = ingest.list_documents()
+    docs = await ingest.list_documents()
     names = {d["filename"] for d in docs}
     assert {"alpha.txt", "beta.txt"}.issubset(names)
 
@@ -429,26 +457,47 @@ async def test_load_or_rebuild_uses_disk_when_available(mock_ollama, monkeypatch
     # Wipe in-memory index, then call load_or_rebuild — should load from disk
     bm25_index._index.build([], [])
     rebuild_calls = []
-    original_rebuild = bm25_index.rebuild
-    monkeypatch.setattr(bm25_index, "rebuild", lambda col: rebuild_calls.append(1) or original_rebuild(col))
+    original_rebuild = bm25_index.rebuild_from_store
 
-    bm25_index.load_or_rebuild(ingest._db())
+    async def counting_rebuild():
+        rebuild_calls.append(1)
+        await original_rebuild()
+
+    monkeypatch.setattr(bm25_index, "rebuild_from_store", counting_rebuild)
+
+    await bm25_index.load_or_rebuild()
 
     assert bm25_index._index.size == original_size
-    assert len(rebuild_calls) == 0, "rebuild() was called even though disk index was available"
+    assert not rebuild_calls, "rebuilt from the store even though a disk index was available"
 
 
 @pytest.mark.asyncio
-async def test_load_or_rebuild_falls_back_to_rebuild(mock_ollama, monkeypatch):
+async def test_load_or_rebuild_falls_back_to_store(mock_ollama, monkeypatch):
     await ingest.ingest(b"Radar cross-section measurement.", "radar.txt")
 
     # Remove the persisted file so load fails
     monkeypatch.setattr(config, "BM25_PATH", "/tmp/nonexistent_geo_assist.pkl")
     bm25_index._index.build([], [])
 
-    bm25_index.load_or_rebuild(ingest._db())
+    await bm25_index.load_or_rebuild()
 
-    assert bm25_index._index.size > 0, "load_or_rebuild did not fall back to ChromaDB rebuild"
+    assert bm25_index._index.size > 0, "load_or_rebuild did not fall back to a store rebuild"
+
+
+@pytest.mark.asyncio
+async def test_bm25_delete_is_incremental(mock_ollama):
+    """Deleting one document must not re-tokenise the whole corpus."""
+    await ingest.ingest(b"Alpha document about thrusters.", "alpha.txt")
+    r = await ingest.ingest(b"Beta document about radiators.", "beta.txt")
+    before = bm25_index.size()
+
+    await ingest.delete_document(r["doc_id"])
+
+    assert bm25_index.size() < before
+    assert [cid for cid, _ in bm25_index.search("radiators", top_k=5)
+            if cid.startswith(r["doc_id"])] == []
+    # The surviving document is still searchable.
+    assert bm25_index.search("thrusters", top_k=5)
 
 
 # ── ingest_many_tracked ───────────────────────────────────────────────────────
@@ -476,13 +525,42 @@ async def test_tracked_job_increments_prepared(mock_ollama):
 
 
 @pytest.mark.asyncio
-async def test_tracked_job_fails_gracefully(mock_ollama, monkeypatch):
+async def test_tracked_job_records_per_file_errors(mock_ollama, monkeypatch):
+    """A per-file failure is reported without failing the whole job.
+
+    Previously any exception propagated out of asyncio.gather and marked the job
+    failed, discarding every other file's already-completed work.
+    """
     import jobs
-    monkeypatch.setattr(ingest, "_prepare", lambda data, fn, folder="General": (_ for _ in ()).throw(RuntimeError("embed failure")))
+
+    async def boom(data, fn, folder="General"):
+        raise RuntimeError("embed failure")
+
+    monkeypatch.setattr(ingest, "_prepare", boom)
     job = jobs.create(total=1)
     await ingest.ingest_many_tracked([(b"data", "file.txt")], job)
-    assert job.status == "failed"
+    assert job.status == "done"
     assert any("embed failure" in e for e in job.errors)
+
+
+@pytest.mark.asyncio
+async def test_tracked_job_partial_failure_keeps_good_files(mock_ollama, monkeypatch):
+    import jobs
+    real_prepare = ingest._prepare
+
+    async def flaky(data, fn, folder="General"):
+        if fn == "bad.txt":
+            raise RuntimeError("unreadable")
+        return await real_prepare(data, fn, folder=folder)
+
+    monkeypatch.setattr(ingest, "_prepare", flaky)
+    files = [(b"one.", "a.txt"), (b"two.", "bad.txt"), (b"three.", "c.txt")]
+    job = jobs.create(total=len(files))
+    await ingest.ingest_many_tracked(files, job)
+
+    assert job.status == "done"
+    assert {r["filename"] for r in job.results} == {"a.txt", "c.txt"}
+    assert any("unreadable" in e for e in job.errors)
 
 
 # ── image extraction ──────────────────────────────────────────────────────────
@@ -612,37 +690,52 @@ def test_extract_images_pdf_deduplicates_by_xref():
 
 # ── OCR ────────────────────────────────────────────────────────────────────────
 
+def _image_ref(tmp_path, page=1, idx=0) -> tuple[int, int, str]:
+    """Write a placeholder JPEG and return the (page, idx, path) ref shape."""
+    path = tmp_path / f"p{page}_i{idx}.jpg"
+    path.write_bytes(b"x" * 100)
+    return (page, idx, str(path))
+
+
 @pytest.mark.asyncio
-async def test_analyze_images_ocr_used_when_enabled(monkeypatch):
-    """_analyze_images uses the OCR result for each image when OCR yields enough words."""
+async def test_analyze_images_ocr_used_when_enabled(monkeypatch, tmp_path):
+    """The OCR result becomes the caption when it yields enough words."""
     monkeypatch.setattr(config, "OCR_ENABLED", True)
     monkeypatch.setattr(config, "OCR_MIN_WORDS", 3)
     monkeypatch.setattr(ingest, "_ocr_image", lambda b: "Error code forty two occurred")
 
-    img_bytes = b"x" * 100
-    images = [(1, 0, img_bytes), (2, 0, img_bytes)]
-    results = await ingest._analyze_images(images, "test.pdf")
+    refs = [_image_ref(tmp_path, 1, 0), _image_ref(tmp_path, 2, 0)]
+    results = await ingest._analyze_images(refs, "test.pdf", "doc123")
 
     assert len(results) == 2
-    assert all(desc == "Error code forty two occurred" for _, _, desc in results)
+    assert all(r["caption"] == "Error code forty two occurred" for r in results)
+    assert all(r["caption_status"] == "ocr" for r in results)
 
 
 @pytest.mark.asyncio
-async def test_analyze_images_sparse_ocr_drops_image(monkeypatch):
-    """When OCR yields too few words, the image is dropped (no vision-model fallback)."""
+async def test_analyze_images_sparse_ocr_kept_as_pending(monkeypatch, tmp_path):
+    """Sparse OCR (a diagram or schematic) is retained for a later vision pass.
+
+    These used to be discarded outright, along with the image bytes, which is why
+    schematics were invisible to search and could not be captioned retroactively.
+    """
     monkeypatch.setattr(config, "OCR_ENABLED", True)
     monkeypatch.setattr(config, "OCR_MIN_WORDS", 10)
+    monkeypatch.setattr(config, "KEEP_UNCAPTIONED_IMAGES", True)
     monkeypatch.setattr(ingest, "_ocr_image", lambda b: None)
 
-    results = await ingest._analyze_images([(1, 0, b"x" * 100)], "test.pdf")
-    assert results == []
+    results = await ingest._analyze_images([_image_ref(tmp_path)], "test.pdf", "doc123")
+    assert len(results) == 1
+    assert results[0]["caption_status"] == "pending"
+    assert results[0]["image_path"]
 
 
 @pytest.mark.asyncio
-async def test_analyze_images_disabled_ocr_drops_all(monkeypatch):
-    """When OCR_ENABLED is False, _analyze_images drops every image."""
+async def test_analyze_images_can_still_drop_when_disabled(monkeypatch, tmp_path):
+    """KEEP_UNCAPTIONED_IMAGES=False restores the old drop-everything behaviour."""
     monkeypatch.setattr(config, "OCR_ENABLED", False)
-    results = await ingest._analyze_images([(1, 0, b"x" * 100)], "test.pdf")
+    monkeypatch.setattr(config, "KEEP_UNCAPTIONED_IMAGES", False)
+    results = await ingest._analyze_images([_image_ref(tmp_path)], "test.pdf", "doc123")
     assert results == []
 
 
@@ -666,13 +759,9 @@ async def test_ingest_pdf_with_images_stores_image_chunks(mock_ollama, monkeypat
 
     assert result["status"] == "ok"
 
-    col = ingest._db()
-    all_items = col.get(include=["documents", "metadatas"])
-    image_chunks = [
-        doc for doc in all_items["documents"]
-        if doc and "[Figure on page" in doc
-    ]
-    assert image_chunks, "Expected at least one image chunk stored in ChromaDB"
+    hits = await store.get_by_filter(None)
+    image_chunks = [text for text, _meta, _d in hits.values() if "[Figure on page" in text]
+    assert image_chunks, "Expected at least one image chunk stored"
     assert any("rocket thruster" in c.lower() for c in image_chunks)
 
 

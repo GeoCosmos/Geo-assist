@@ -200,6 +200,65 @@ if (Get-Command "ffmpeg" -ErrorAction SilentlyContinue) {
 }
 Write-Host ""
 
+# ── start Qdrant ──────────────────────────────────────────────────────────────
+# Qdrant runs as a local server process bound to loopback. Embedded mode is not
+# used: it is brute-force only and documented as suitable for under ~20k points,
+# where the production corpus is ~148k chunks.
+#
+# The binary is expected at .\qdrant\qdrant.exe. It is not committed to the repo
+# (~30 MB); download it once from https://github.com/qdrant/qdrant/releases
+# (qdrant-x86_64-pc-windows-msvc.zip) and unzip it there. On an air-gapped
+# machine, copy it across with the release zip.
+$QdrantPort    = if ($env:GEO_QDRANT_PORT) { $env:GEO_QDRANT_PORT } else { "6333" }
+$QdrantExe     = Join-Path $PSScriptRoot "qdrant\qdrant.exe"
+$QdrantStorage = Join-Path $PSScriptRoot "data\qdrant"
+$QdrantProc    = $null
+
+function Test-QdrantUp {
+    try {
+        Invoke-RestMethod -Uri "http://127.0.0.1:$QdrantPort/readyz" -TimeoutSec 2 | Out-Null
+        return $true
+    } catch { return $false }
+}
+
+Write-Host "Checking Qdrant..."
+if (Test-QdrantUp) {
+    Write-Host "  [OK] Qdrant already running on port $QdrantPort" -ForegroundColor Green
+} elseif (-not (Test-Path $QdrantExe)) {
+    Write-Host "  [!!] qdrant.exe not found at $QdrantExe" -ForegroundColor Red
+    Write-Host "       Download qdrant-x86_64-pc-windows-msvc.zip from" -ForegroundColor Yellow
+    Write-Host "       https://github.com/qdrant/qdrant/releases and unzip it to .\qdrant\" -ForegroundColor Yellow
+    Write-Host "       (air-gapped: copy the exe across alongside the release zip)" -ForegroundColor Yellow
+    Read-Host "`nPress Enter to exit"
+    exit 1
+} else {
+    New-Item -ItemType Directory -Force -Path $QdrantStorage | Out-Null
+    # Bind to loopback explicitly — the default 0.0.0.0 would expose the whole
+    # document corpus to anything on the local network.
+    $env:QDRANT__SERVICE__HOST = "127.0.0.1"
+    $env:QDRANT__SERVICE__HTTP_PORT = "$QdrantPort"
+    $env:QDRANT__STORAGE__STORAGE_PATH = $QdrantStorage
+    $env:QDRANT__TELEMETRY_DISABLED = "true"
+    Write-Host "  Starting Qdrant on 127.0.0.1:$QdrantPort ..." -ForegroundColor Cyan
+    $QdrantProc = Start-Process $QdrantExe -PassThru -WindowStyle Hidden `
+        -WorkingDirectory (Split-Path $QdrantExe)
+
+    $qready = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 500
+        if (Test-QdrantUp) { $qready = $true; break }
+    }
+    if ($qready) {
+        Write-Host "  [OK] Qdrant ready" -ForegroundColor Green
+    } else {
+        Write-Host "  [!!] Qdrant did not become ready in 15s." -ForegroundColor Red
+        if ($QdrantProc -and -not $QdrantProc.HasExited) { $QdrantProc.Kill() }
+        Read-Host "`nPress Enter to exit"
+        exit 1
+    }
+}
+Write-Host ""
+
 # ── install / verify Python dependencies ─────────────────────────────────────
 Write-Host "Checking Python dependencies..."
 python -m pip install -r requirements.txt -q --no-warn-script-location
@@ -214,8 +273,8 @@ Write-Host ""
 # ── start uvicorn ─────────────────────────────────────────────────────────────
 # --loop asyncio: explicit asyncio event loop (uvloop is Unix-only; this is
 #   the correct Windows backend and avoids any ProactorEventLoop ambiguity).
-# --workers 1: FastAPI + ChromaDB share in-process state; multiple workers
-#   would each open a separate ChromaDB connection and BM25 index.
+# --workers 1: the BM25 index and document cache are in-process state; multiple
+#   workers would each hold their own copy and drift out of sync after a write.
 # --no-access-log: reduces noise; errors still appear.
 Write-Host "Starting Geo-Assist server..."
 $proc = Start-Process python `
@@ -290,5 +349,11 @@ try {
     if (-not $proc.HasExited) {
         Write-Host "`nShutting down Geo-Assist..." -ForegroundColor Yellow
         $proc.Kill()
+    }
+    # Only stop Qdrant if this script started it — leave a pre-existing instance
+    # alone, since something else may be using it.
+    if ($QdrantProc -and -not $QdrantProc.HasExited) {
+        Write-Host "Stopping Qdrant..." -ForegroundColor Yellow
+        $QdrantProc.Kill()
     }
 }

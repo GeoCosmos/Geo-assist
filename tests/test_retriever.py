@@ -5,25 +5,24 @@ Key scenario: a transcript document contains GPA information.
 We verify the correct chunks are retrieved and passed to the LLM.
 """
 from unittest.mock import patch
+
+import pytest
+
 import config
 import ingest
-import reranker
 import retriever
+import store
 from tests.conftest import make_embedding
 
 
 async def test_gpa_chunk_is_retrieved(ingested_transcript):
     """The chunk containing 'Cumulative GPA' must be in the top results."""
-    q_vec = make_embedding("What is the cumulative GPA?")
-    col = ingest._db()
-    results = col.query(
-        query_embeddings=[q_vec],
-        n_results=ingest.config.RETRIEVAL_K,
-        include=["documents", "distances"],
-    )
-    combined = " ".join(results["documents"][0])
+    q_vec = make_embedding("search_query: What is the cumulative GPA?")
+    hits = await store.query_embedding(q_vec, top_k=config.RETRIEVAL_K)
+    texts = [text for text, _meta, _dist in hits.values()]
+    combined = " ".join(texts)
     assert "3.78" in combined or "GPA" in combined, (
-        "GPA chunk was not retrieved. Retrieved:\n" + "\n---\n".join(results["documents"][0])
+        "GPA chunk was not retrieved. Retrieved:\n" + "\n---\n".join(texts)
     )
 
 
@@ -67,12 +66,13 @@ async def test_answer_no_docs_returns_not_found(mock_ollama):
 
 async def test_answer_irrelevant_question_returns_not_found(ingested_transcript, mock_ollama):
     """A question with no matching context should not hallucinate."""
-    with patch.object(ingest._db(), "query", return_value={
-        "ids": [["chunk_0"]],
-        "documents": [["unrelated chunk"]],
-        "metadatas": [[{"doc_id": "x", "filename": "other.txt", "page": 1}]],
-        "distances": [[2.0]],   # above DISTANCE_THRESHOLD of 1.3
-    }):
+    async def only_distant_hits(vector, top_k, filters=None):
+        # 2.0 is above DISTANCE_THRESHOLD (1.3), so the semantic gate must close.
+        return {"x_1_0": ("unrelated chunk",
+                          {"doc_id": "x", "filename": "other.txt", "page": 1, "chunk_index": 0},
+                          2.0)}
+
+    with patch.object(store, "query_embedding", side_effect=only_distant_hits):
         result = await retriever.answer("What is the weather forecast?")
 
     assert "not in the ingested documents" in result["answer"]
@@ -177,7 +177,7 @@ async def test_generate_procedure_steps_fallback_on_no_numbered_output(mock_olla
 async def test_inject_system_names_missing_summary_no_crash(mock_ollama):
     """_inject_system_names must not crash when the summary chunk doesn't exist.
 
-    Bug: rrf_scores[summary_cid] was set unconditionally even when col.get()
+    Bug: rrf_scores[summary_cid] was set unconditionally even when the fetch
     returned no results, leaving a cid in rrf_scores with no entry in sem_hits.
     _diverse_top then raised KeyError on sem_hits[cid][1].
     """
@@ -185,60 +185,36 @@ async def test_inject_system_names_missing_summary_no_crash(mock_ollama):
         b"ATLAS-9 Detector Array nominal current 4.5 A at 28 V.",
         "atlas.txt",
     )
-    col = ingest._db()
-    # Verify the index has chunks but deliberately has no summary chunk for page 2+
-    # (the bug triggers whenever summary_cid points to a non-existent chunk).
     sem_hits: dict = {}
     rrf_scores: dict = {}
     named_doc_set: set = set()
-    # Directly call _inject_system_names with a sys_name whose BM25 top hit
-    # builds a summary_cid that doesn't exist in ChromaDB.
-    import bm25_index as bm25_mod
-    bm25_mod.rebuild(col)
-    sys_results = bm25_mod.search("ATLAS-9 Detector Array")
-    if sys_results and sys_results[0][1] > 0:
-        top_cid = sys_results[0][0]
-        parts = top_cid.split("_")
-        # Manufacture a summary_cid that intentionally won't exist
-        fake_summary_cid = parts[0] + "_99_-1"
-        # Patch the BM25 search to return the top hit so _inject_system_names
-        # uses our fake summary_cid derivation path by using page 99
-        original_top = sys_results[0]
-        fake_top_cid = parts[0] + "_99_0"
-        col.add(
-            ids=[fake_top_cid],
-            embeddings=[[0.0] * 768],
-            documents=["ATLAS-9 Detector Array on a non-existent page"],
-            metadatas=[{"doc_id": parts[0], "filename": "atlas.txt", "page": 99, "folder": "General"}],
+
+    # A BM25 hit whose derived summary_cid points at a chunk that does not exist.
+    ghost_top_cid = "deadbeef12345678_99_0"
+    with patch("bm25_index.search", return_value=[(ghost_top_cid, 1.0)]):
+        await retriever._inject_system_names(
+            ["ATLAS-9 Detector Array"], sem_hits, rrf_scores, named_doc_set
         )
-        bm25_mod.rebuild(col)
-        with patch("bm25_index.search", return_value=[(fake_top_cid, 1.0)]):
-            # Should not raise KeyError
-            retriever._inject_system_names(
-                ["ATLAS-9 Detector Array"], sem_hits, rrf_scores, named_doc_set, col
-            )
-        # The key invariant: every cid in rrf_scores must also be in sem_hits
-        for cid in rrf_scores:
-            assert cid in sem_hits, f"cid {cid!r} in rrf_scores but missing from sem_hits"
+
+    # The key invariant: every cid in rrf_scores must also be in sem_hits
+    for cid in rrf_scores:
+        assert cid in sem_hits, f"cid {cid!r} in rrf_scores but missing from sem_hits"
 
 
 async def test_apply_comparison_boost_missing_chunk_no_crash(mock_ollama):
-    """_apply_comparison_boost must not crash when col.get returns no results for a BM25 hit.
+    """The boost must not crash when a BM25 hit has no corresponding stored chunk.
 
-    Bug: rrf_scores[cid] was set unconditionally even when col.get() came back
+    Bug: rrf_scores[cid] was set unconditionally even when the fetch came back
     empty, leaving orphan cids in rrf_scores that caused KeyError in _diverse_top.
     """
     await ingest.ingest(b"Performance benchmark results for system A.", "bench.txt")
-    col = ingest._db()
-    import bm25_index as bm25_mod
-    bm25_mod.rebuild(col)
 
     sem_hits: dict = {}
     rrf_scores: dict = {}
-    ghost_cid = "deadbeef_1_0"  # cid that exists in BM25 but not in ChromaDB
+    ghost_cid = "deadbeef12345678_1_0"  # in BM25, absent from the store
     with patch("bm25_index.search", return_value=[(ghost_cid, 5.0)]):
         await retriever._apply_comparison_boost(
-            "which system performs best", sem_hits, rrf_scores, col, None, None
+            "which system performs best", sem_hits, rrf_scores, None, None
         )
     for cid in rrf_scores:
         assert cid in sem_hits, f"cid {cid!r} in rrf_scores but missing from sem_hits"
@@ -315,7 +291,7 @@ async def test_score_band_non_reranked_chunks_capped(mock_ollama, monkeypatch):
         )
 
     import bm25_index as bm25_mod
-    bm25_mod.rebuild(ingest._db())
+    await bm25_mod.rebuild_from_store()
 
     reranked_cids_seen: list[str] = []
 
@@ -346,7 +322,6 @@ async def test_score_band_non_reranked_chunks_capped(mock_ollama, monkeypatch):
         if cid in reranked_set:
             continue
         # Injected chunks (sentinel distances ≥ 991) are exempt from the cap.
-        dist = ingest._db().get(ids=[cid], include=["metadatas"])
         # Use the score itself as proxy: if it's very high it must be injected.
         # Regular retrieval chunks (non-injected, non-reranked) must be ≤ floor.
         # We allow summary-boosted chunks that entered the reranker pool to be absent
@@ -388,158 +363,66 @@ async def test_retrieval_eval_specific_value_in_context(mock_ollama):
 
 
 # ---------------------------------------------------------------------------
-# Revision extraction unit tests
+# Catalog field extraction
+#
+# Document number and revision are now resolved once at ingest time by an LLM
+# call and stored in chunk metadata (ingest._extract_catalog_fields), replacing
+# ~280 lines of query-time regex tuned to one customer's revision conventions
+# and the ~16 unit tests that pinned each of its branches. The behaviour worth
+# testing is no longer "does this regex recognise E3R10" but "does a catalog
+# query serve what ingest stored".
 # ---------------------------------------------------------------------------
 
-def test_revision_table_single_column_highest():
-    """Single-column Is.Rev table returns the highest value as X.X (not last in reading order)."""
-    from retriever import _latest_revision_from_chunks
-    # Newest-first (descending) EXRX table — must return highest as X.X
-    chunks = [
-        "| Is.Rev | Date | Author |\n| --- | --- | --- |\n| E4R0 | 2025-01-01 | Jones |\n| E3R10 | 2024-06-01 | Smith |\n| E2R5 | 2023-01-01 | Brown |",
-    ]
-    result = _latest_revision_from_chunks(chunks)
-    assert result == "4.0", f"Expected 4.0, got {result!r}"
+@pytest.mark.asyncio
+async def test_catalog_fields_parsed_from_llm_reply(monkeypatch):
+    import ingest
+
+    async def fake_chat(system, user, model=None, history=None):
+        return "DOC: GCA-2024-0002\nREV: 5.9"
+
+    monkeypatch.setattr("llm.chat", fake_chat)
+    doc_no, rev = await ingest._extract_catalog_fields("spec.pdf", "Some front matter")
+    assert doc_no == "GCA-2024-0002"
+    assert rev == "5.9"
 
 
-def test_revision_table_numeric_version_aware():
-    """3.10 > 3.9 version-aware comparison (not lexicographic)."""
-    from retriever import _latest_revision_from_chunks
-    chunks = [
-        "| Revision | Date |\n| --- | --- |\n| 3.9 | 2023-01-01 |\n| 3.10 | 2024-01-01 |",
-    ]
-    result = _latest_revision_from_chunks(chunks)
-    assert result == "3.10", f"Expected 3.10, got {result!r}"
+@pytest.mark.asyncio
+async def test_catalog_fields_absent_become_em_dash(monkeypatch):
+    import ingest
+
+    async def fake_chat(system, user, model=None, history=None):
+        return "DOC: \u2014\nREV: \u2014"
+
+    monkeypatch.setattr("llm.chat", fake_chat)
+    assert await ingest._extract_catalog_fields("notes.txt", "no header here") == ("\u2014", "\u2014")
 
 
-def test_revision_table_beats_dotnum():
-    """Table scan takes priority over Is.Rev dotnum in body text."""
-    from retriever import _latest_revision_from_chunks
-    # Is.Rev 2.0 appears in body text but revision table has 4.0 — table wins
-    chunks = [
-        "Is.Rev 2.0\n\n| Revision | Date |\n| --- | --- |\n| 3.5 | 2023 |\n| 4.0 | 2024 |",
-    ]
-    result = _latest_revision_from_chunks(chunks)
-    assert result == "4.0", f"Expected 4.0 (table), got {result!r}"
+@pytest.mark.asyncio
+async def test_catalog_fields_survive_llm_failure(monkeypatch):
+    """A failed extraction must not fail the ingest."""
+    import ingest
+
+    async def boom(system, user, model=None, history=None):
+        raise RuntimeError("ollama down")
+
+    monkeypatch.setattr("llm.chat", boom)
+    assert await ingest._extract_catalog_fields("spec.pdf", "front matter") == ("\u2014", "\u2014")
 
 
-def test_revision_dotnum_colon_separator():
-    """Is.Rev: 3.10 with colon separator is matched (page-1 title block format)."""
-    from retriever import _latest_revision_from_chunks
-    chunks = ["Document Title\nIs.Rev: 3.10\nDate: 2024-01-15"]
-    result = _latest_revision_from_chunks(chunks)
-    assert result == "3.10", f"Expected 3.10, got {result!r}"
+@pytest.mark.asyncio
+async def test_catalog_stream_serves_stored_metadata(mock_ollama, monkeypatch):
+    """The catalog table is built from stored metadata, not re-parsed per query."""
+    import ingest
+    import retriever
 
+    async def fake_fields(filename, front_matter):
+        return ("GCA-9001", "3.10")
 
-def test_revision_dotnum_fallback_when_no_table():
-    """Is.Rev N.M used when no revision table is found."""
-    from retriever import _latest_revision_from_chunks
-    chunks = [
-        "Document Title\nIs.Rev 3.10\nDate: 2024-01-15",
-    ]
-    result = _latest_revision_from_chunks(chunks)
-    assert result == "3.10", f"Expected 3.10, got {result!r}"
+    monkeypatch.setattr(ingest, "_extract_catalog_fields", fake_fields)
+    await ingest.ingest(b"Thruster qualification report.", "qual.txt")
 
-
-def test_revision_dotnum_spaces_and_dots():
-    """Is. Rev. 2.5 with spaces and dots should also match."""
-    from retriever import _latest_revision_from_chunks
-    chunks = ["Is. Rev. 2.5  Author: Jones"]
-    result = _latest_revision_from_chunks(chunks)
-    assert result == "2.5", f"Expected 2.5, got {result!r}"
-
-
-def test_revision_exrx_labeled_in_body_text():
-    """Is.Rev-labeled EXRX in body text returned as X.X; bare EXRX is NOT matched."""
-    from retriever import _latest_revision_from_chunks
-    # bare EXRX in body text (e.g. part number suffix) — should be ignored
-    chunks = ["Technical document E3R10 revision history."]
-    result = _latest_revision_from_chunks(chunks)
-    assert result == "—", f"Bare EXRX should not match, got {result!r}"
-
-
-def test_revision_exrx_highest_pair():
-    """Is.Rev-labeled EXRX: highest E+R wins, returned as X.X."""
-    from retriever import _latest_revision_from_chunks
-    chunks = ["Is.Rev E2R5 previous release. Is.Rev E3R10 current. Is.Rev E3R9 draft."]
-    result = _latest_revision_from_chunks(chunks)
-    assert result == "3.10", f"Expected 3.10, got {result!r}"
-
-
-def test_revision_is_num_rev_num_body_text():
-    """'Is. N - Rev. M' split format in body text (dtu-style running header)."""
-    from retriever import _latest_revision_from_chunks
-    chunks = ["COMMAND RANGING UNIT\nIs. 5 - Rev. 9\nMCS USER'S MANUAL\nDate: February 9, 2017"]
-    result = _latest_revision_from_chunks(chunks)
-    assert result == "5.9", f"Expected 5.9, got {result!r}"
-
-
-def test_revision_is_num_rev_num_highest():
-    """When 'Is. N - Rev. M' appears multiple times, highest pair wins."""
-    from retriever import _latest_revision_from_chunks
-    chunks = ["Is. 5 - Rev. 8 older\nIs. 5 - Rev. 9 current"]
-    result = _latest_revision_from_chunks(chunks)
-    assert result == "5.9", f"Expected 5.9, got {result!r}"
-
-
-def test_revision_page_header_no_pipe_no_false_positive():
-    """Page headers stop at pipe lines — table body with 'Is.\\nRev.\\nDate' doesn't give 'D'."""
-    from retriever import _revision_from_page_headers
-    # Non-pipe stacked-column table on page 2: headers and data on separate lines
-    text = "[doc.pdf] EVOLUTIONS\n\nIs. \nRev. \nDate \nDescription\n\n3 \n27 \nSeptember 27, 2018"
-    text_pairs = [("Cover page", {"page": 1}), (text, {"page": 2})]
-    result = _revision_from_page_headers(text_pairs)
-    assert result == "—", f"Expected '—' (no false positive), got {result!r}"
-
-
-def test_revision_page_header_combined_is_abbrev():
-    """'Is. N - Rev. M' in a running header is parsed as N.M by _revision_from_page_headers."""
-    from retriever import _revision_from_page_headers
-    text_pairs = [
-        ("Cover page", {"page": 1}),
-        ("DOCUMENT TITLE\nIs. 5 - Rev. 9\nDate: 2017", {"page": 2}),
-    ]
-    result = _revision_from_page_headers(text_pairs)
-    assert result == "5.9", f"Expected 5.9, got {result!r}"
-
-
-def test_revision_two_column_table():
-    """| Is. | Rev. | separate column headers detected and combined as N.M."""
-    from retriever import _latest_revision_from_chunks
-    chunks = [
-        "| Is. | Rev. | Date | Description |\n| --- | --- | --- | --- |\n| 3 | 10 | 2024-01-01 | Initial |\n| 4 | 0 | 2025-06-01 | Updated |",
-    ]
-    result = _latest_revision_from_chunks(chunks)
-    assert result == "4.0", f"Expected 4.0, got {result!r}"
-
-
-def test_revision_two_column_issue_full_word():
-    """| Issue | Rev. | headers (full word) also match."""
-    from retriever import _latest_revision_from_chunks
-    chunks = [
-        "| Issue | Rev. | Date |\n| --- | --- | --- |\n| 1 | A | 2022 |\n| 2 | A | 2023-05-01 |",
-    ]
-    result = _latest_revision_from_chunks(chunks)
-    assert result == "2.A", f"Expected 2.A, got {result!r}"
-
-
-def test_revision_page_header_exrx():
-    """EXRX in page 2+ running header returned as X.X by _revision_from_page_headers."""
-    from retriever import _revision_from_page_headers
-    text_pairs = [
-        ("Page 1 title block content", {"page": 1}),
-        ("Company Name  E3R10  Document Title\nOther header content", {"page": 2}),
-    ]
-    result = _revision_from_page_headers(text_pairs)
-    assert result == "3.10", f"Expected 3.10, got {result!r}"
-
-
-def test_revision_page_header_is_rev_dotnum():
-    """Is.Rev N.M in a page header is extracted by _revision_from_page_headers."""
-    from retriever import _revision_from_page_headers
-    text_pairs = [
-        ("Cover page", {"page": 1}),
-        ("Title  Is.Rev 5.2  Date 2024", {"page": 2}),
-    ]
-    result = _revision_from_page_headers(text_pairs)
-    assert result == "5.2", f"Expected 5.2, got {result!r}"
+    rows = [c async for c in retriever._catalog_stream("list all documents", None)]
+    table = "".join(c["token"] for c in rows if "token" in c)
+    assert "qual.txt" in table
+    assert "GCA-9001" in table
+    assert "3.10" in table

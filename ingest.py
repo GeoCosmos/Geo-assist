@@ -5,48 +5,46 @@ import io
 import logging
 import os
 import re
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-
-log = logging.getLogger(__name__)
-
-import chromadb
-from chromadb.config import Settings
 
 import bm25_index
 import config
 import llm
+import store
+
+log = logging.getLogger(__name__)
 
 _lock = asyncio.Lock()
 _background_tasks: set = set()
-_PREPARE_CONCURRENCY = 16  # max files parsed+embedded concurrently; bounds peak RAM on large batches
-_chroma_client: chromadb.ClientAPI | None = None
-_chroma: chromadb.Collection | None = None
 _doc_cache: list[dict] | None = None
+
+# Document parsing (PyMuPDF, python-docx, python-pptx) is pure CPU work that
+# holds the GIL. Running it inline in an async function — as this module used to —
+# meant `_PREPARE_CONCURRENCY = 16` bought no parallelism at all: every file was
+# parsed one after another on the event loop, which also stalled `/ingest/status`
+# polls and any in-flight query. A process pool gives real multi-core throughput
+# on the target i7-12700 and keeps the loop responsive.
+_parse_pool: ProcessPoolExecutor | None = None
+
+
+def _pool() -> ProcessPoolExecutor:
+    global _parse_pool
+    if _parse_pool is None:
+        _parse_pool = ProcessPoolExecutor(max_workers=config.PREPARE_CONCURRENCY)
+    return _parse_pool
+
+
+def shutdown_pool() -> None:
+    global _parse_pool
+    if _parse_pool is not None:
+        _parse_pool.shutdown(wait=False, cancel_futures=True)
+        _parse_pool = None
 
 
 def _invalidate_cache() -> None:
     global _doc_cache
     _doc_cache = None
-
-
-def _client() -> chromadb.ClientAPI:
-    global _chroma_client
-    if _chroma_client is None:
-        os.makedirs(config.CHROMA_PATH, exist_ok=True)
-        _chroma_client = chromadb.PersistentClient(
-            path=config.CHROMA_PATH,
-            settings=Settings(anonymized_telemetry=False),
-        )
-    return _chroma_client
-
-
-def _db() -> chromadb.Collection:
-    global _chroma
-    if _chroma is None:
-        _chroma = _client().get_or_create_collection(
-            "docs", metadata={"hnsw:space": "cosine"}
-        )
-    return _chroma
 
 
 # ── text extraction ───────────────────────────────────────────────────────────
@@ -373,6 +371,7 @@ def extract_images(data: bytes, filename: str) -> list[tuple[int, int, bytes]]:
 def _preprocess_image(img_bytes: bytes) -> bytes:
     """Resize to OCR_IMAGE_MAX_SIDE, re-encode as JPEG at OCR_IMAGE_JPEG_QUALITY, strip metadata."""
     import io
+
     from PIL import Image
     with Image.open(io.BytesIO(img_bytes)) as img:
         img = img.convert("RGB")
@@ -383,33 +382,72 @@ def _preprocess_image(img_bytes: bytes) -> bytes:
         return out.getvalue()
 
 
-async def _analyze_images(
-    images: list[tuple[int, int, bytes]], filename: str
-) -> list[tuple[int, int, str]]:
-    """OCR each image. Returns (page_num, img_idx, description).
+def _image_path(doc_id: str, page_num: int, img_idx: int) -> str:
+    return os.path.join(config.IMAGES_DIR, doc_id, f"p{page_num}_i{img_idx}.jpg")
 
-    Images that fail analysis are silently dropped so a bad image never aborts ingest.
+
+async def _analyze_images(
+    image_refs: list[tuple[int, int, str]], filename: str, doc_id: str
+) -> list[dict]:
+    """Caption each already-persisted image. Returns one record per retained image.
+
+    The images were already downscaled, re-encoded and written to disk by the
+    parse worker. Two behaviours differ from the previous pipeline, both aimed at
+    not throwing away information that is expensive to recover:
+
+    * The JPEG is kept. Previously the bytes were discarded after OCR, so adding a
+      vision model later would have required re-parsing every source document.
+      Retrieval still runs purely over the text caption — joint image/text
+      embedding models are strongly biased toward text and retrieve images poorly
+      — but the image is now available to show the user or pass to a vision model
+      at answer time.
+    * Images whose OCR output is too sparse (diagrams, schematics, wiring) are no
+      longer dropped. They are stored with `caption_status="pending"` so a later
+      captioning pass can find them by filter without re-parsing anything.
+
+    Image failures never abort an ingest.
     """
-    if not images:
+    if not image_refs:
         return []
 
-    async def _one(page_num: int, img_idx: int, img_bytes: bytes):
-        try:
-            processed = _preprocess_image(img_bytes)
-        except Exception:
-            log.warning("image preprocessing failed for %s page %d", filename, page_num, exc_info=True)
-            processed = img_bytes
+    loop = asyncio.get_running_loop()
+    # easyocr holds the GIL and is memory-hungry; bound it rather than letting the
+    # default executor spawn ~32 threads each loading a PyTorch model.
+    ocr_sem = asyncio.Semaphore(config.PREPARE_CONCURRENCY)
 
+    async def _one(page_num: int, img_idx: int, path: str) -> dict | None:
+        caption, status = "", "pending"
         if config.OCR_ENABLED:
-            loop = asyncio.get_event_loop()
-            ocr_text = await loop.run_in_executor(None, _ocr_image, processed)
+            async with ocr_sem:
+                ocr_text = await loop.run_in_executor(None, _ocr_image_file, path)
             if ocr_text:
-                return (page_num, img_idx, ocr_text)
+                caption, status = ocr_text, "ocr"
+        if not caption and not config.KEEP_UNCAPTIONED_IMAGES:
+            return None
+        return {
+            "page": page_num,
+            "img_idx": img_idx,
+            "caption": caption,
+            "caption_status": status,
+            "image_path": path,
+        }
 
+    results = await asyncio.gather(*[_one(p, i, path) for p, i, path in image_refs])
+    return [r for r in results if r is not None]
+
+
+def _ocr_image_file(path: str) -> str | None:
+    try:
+        with open(path, "rb") as f:
+            return _ocr_image(f.read())
+    except OSError:
+        log.warning("could not read image for OCR: %s", path)
         return None
 
-    results = await asyncio.gather(*[_one(p, i, b) for p, i, b in images])
-    return [r for r in results if r is not None]
+
+def _write_bytes(path: str, data: bytes) -> None:
+    with open(path, "wb") as f:
+        f.write(data)
 
 
 # Image chunks use negative chunk_index values starting here to avoid colliding
@@ -587,44 +625,51 @@ def _summary_chunk(title: str, full_text: str) -> str | None:
 async def _analyze_and_store_images(
     doc_id: str, title: str, filename: str, folder: str, raw_images: list,
 ) -> None:
-    """Background task: run OCR then append image chunks to ChromaDB.
+    """Background task: caption images then append image chunks to the store.
 
     Fires after text chunks are already committed, so ingest is never blocked
     waiting on OCR.
     """
-    image_descriptions = await _analyze_images(raw_images, filename)
-    if not image_descriptions:
+    records = await _analyze_images(raw_images, filename, doc_id)
+    if not records:
         return
-    image_chunks = [
-        {
+
+    specs, texts, bm_ids, bm_texts = [], [], [], []
+    for rec in records:
+        page_num = rec["page"]
+        chunk_index = _IMAGE_CHUNK_IDX_BASE - rec["img_idx"]
+        cid = f"{doc_id}_{page_num}_{chunk_index}"
+        caption = rec["caption"] or "(uncaptioned figure — pending vision pass)"
+        text = f"[{title}] [Figure on page {page_num}]: {caption}"
+        specs.append((cid, text, {
+            "doc_id": doc_id,
+            "filename": filename,
             "page": page_num,
-            "chunk_index": _IMAGE_CHUNK_IDX_BASE - img_idx,
-            "text": f"[Figure on page {page_num}]: {desc}",
+            "chunk_index": chunk_index,
+            "folder": folder,
             "chunk_type": "image",
-        }
-        for page_num, img_idx, desc in image_descriptions
+            "caption_status": rec["caption_status"],
+            "image_path": rec["image_path"],
+        }))
+        texts.append(text)
+        bm_ids.append(cid)
+        bm_texts.append(f"[{filename}] {text}")
+
+    embeddings = await llm.embed(texts)
+    documents = [
+        store.to_document(cid, text, meta, emb)
+        for (cid, text, meta), emb in zip(specs, embeddings)
     ]
-    image_texts = [f"[{title}] {c['text']}" for c in image_chunks]
-    image_embeddings = await llm.embed(image_texts)
+
     async with _lock:
-        col = _db()
-        # Skip if the document was deleted while we were analyzing images
-        if not col.get(where={"doc_id": doc_id})["ids"]:
+        # Skip if the document was deleted while we were captioning.
+        if not await store.get_by_filter(store.eq("doc_id", doc_id)):
             return
-        ids = [f"{doc_id}_{c['page']}_{c['chunk_index']}" for c in image_chunks]
-        metadatas = [
-            {
-                "doc_id": doc_id,
-                "filename": filename,
-                "page": c["page"],
-                "folder": folder,
-                "chunk_type": "image",
-            }
-            for c in image_chunks
-        ]
-        col.add(ids=ids, embeddings=image_embeddings, documents=image_texts, metadatas=metadatas)
+        await store.add(documents)
+        bm25_index.add(bm_ids, bm_texts, {cid: folder for cid in bm_ids})
+        bm25_index.commit()
         _invalidate_cache()
-    log.info("stored %d image chunk(s) for %s", len(image_chunks), filename)
+    log.info("stored %d image chunk(s) for %s", len(documents), filename)
 
 
 _LLM_SUMMARY_SYSTEM = (
@@ -659,213 +704,349 @@ async def _llm_summary(title: str, front_matter_text: str) -> str | None:
         return None
 
 
+_CATALOG_FIELDS_SYSTEM = (
+    "You are a technical document indexer. From the front matter of an engineering "
+    "document, extract the document/reference number and the latest revision or "
+    "issue number.\n"
+    "Reply with exactly two lines and nothing else:\n"
+    "DOC: <document number, or — if absent>\n"
+    "REV: <revision or issue number, or — if absent>\n"
+    "Copy values verbatim. Never invent a number that is not in the text."
+)
+_DOC_LINE = re.compile(r"^\s*DOC\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+_REV_LINE = re.compile(r"^\s*REV\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+async def _extract_catalog_fields(filename: str, front_matter: str) -> tuple[str, str]:
+    """Resolve document number and revision once, at ingest time.
+
+    These used to be recomputed per query by ~280 lines of regex tuned to one
+    customer's "Is. 3 - Rev. 2" / "E3R10" conventions, which meant every catalog
+    query re-parsed every document and any unfamiliar convention silently produced
+    an em dash. Extracting once and storing the result in metadata makes catalog
+    queries a metadata read, and makes a wrong value fixable by re-ingesting one
+    file rather than by adding another regex branch.
+    """
+    if not front_matter.strip():
+        return "—", "—"
+    try:
+        raw = await llm.chat(
+            system=_CATALOG_FIELDS_SYSTEM,
+            user=f"Document: {filename}\n\nFront matter:\n{front_matter[:2000]}",
+        )
+    except Exception:  # a missing catalog field must not fail ingest
+        log.warning("catalog field extraction failed for %s", filename, exc_info=True)
+        return "—", "—"
+
+    def _pick(pattern: re.Pattern) -> str:
+        m = pattern.search(raw)
+        val = (m.group(1).strip(" \t\"'") if m else "")
+        return val if val and val not in {"-", "--"} else "—"
+
+    return _pick(_DOC_LINE), _pick(_REV_LINE)
+
+
+def _parse_worker(original_path: str, filename: str, doc_id: str) -> dict:
+    """Parse + chunk + extract images. Runs in a worker process.
+
+    Everything here is CPU-bound and GIL-holding, which is exactly why it must not
+    run on the event loop. Images are written to disk inside the worker so large
+    byte buffers are never pickled back across the process boundary.
+    """
+    with open(original_path, "rb") as f:
+        data = f.read()
+
+    pages = extract_pages(data, filename)
+    chunks = chunk_pages(pages)
+    _tag_table_chunks(doc_id, pages, chunks)
+
+    image_refs: list[tuple[int, int, str]] = []
+    for page_num, img_idx, img_bytes in extract_images(data, filename):
+        try:
+            processed = _preprocess_image(img_bytes)
+        except Exception:
+            processed = img_bytes
+        path = _image_path(doc_id, page_num, img_idx)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            _write_bytes(path, processed)
+            image_refs.append((page_num, img_idx, path))
+        except OSError:
+            continue
+
+    return {
+        "pages": pages,
+        "chunks": chunks,
+        "title": _extract_doc_title(pages, filename),
+        "image_refs": image_refs,
+    }
+
+
 async def _prepare(data: bytes, filename: str, folder: str = "General") -> dict:
     """Parse, chunk, and embed one file. The slow part — safe to run concurrently."""
     doc_id = hashlib.sha256(data).hexdigest()[:16]
+    loop = asyncio.get_running_loop()
 
     # Keep the original file so citations can link back to it. doc_id is a content
     # hash, so this is naturally idempotent on re-ingest — no lock needed.
     os.makedirs(config.ORIGINALS_DIR, exist_ok=True)
     ext = Path(filename).suffix.lower()
-    with open(os.path.join(config.ORIGINALS_DIR, f"{doc_id}{ext}"), "wb") as f:
-        f.write(data)
+    original_path = os.path.join(config.ORIGINALS_DIR, f"{doc_id}{ext}")
+    # Offloaded: a blocking write of a 100 MB upload stalls every other request.
+    await loop.run_in_executor(None, _write_bytes, original_path, data)
+    del data  # release the upload buffer before parsing allocates its own
 
-    pages = extract_pages(data, filename)
-    chunks = chunk_pages(pages)
+    parsed = await loop.run_in_executor(_pool(), _parse_worker, original_path, filename, doc_id)
+    pages, chunks, title = parsed["pages"], parsed["chunks"], parsed["title"]
     if not chunks:
         return {"doc_id": doc_id, "filename": filename, "status": "empty"}
 
-    title = _extract_doc_title(pages, filename)
+    front_matter = "\n".join(text for _, text in pages[:3])
     full_text = "\n".join(text for _, text in pages)
 
     # Synthetic summary chunk — KV-pattern extraction for spec tables; LLM fallback
     # for manuals, reports, and procedures where no KV rows are present.
     summary = _summary_chunk(title, full_text)
     if not summary:
-        front_matter_text = "\n".join(text for _, text in pages[:3])
-        llm_sum = await _llm_summary(title, front_matter_text)
+        llm_sum = await _llm_summary(title, front_matter)
         if llm_sum:
             summary = f"{title} — {llm_sum}"
-    summary_chunk_list = [{"page": 1, "chunk_index": -1, "text": summary}] if summary else []
 
-    _tag_table_chunks(doc_id, pages, chunks)
+    doc_number, revision = await _extract_catalog_fields(filename, front_matter)
 
-    text_embeddings = await llm.embed(
-        ([summary] if summary else []) + [f"[{title}] {c['text']}" for c in chunks]
-    )
+    all_chunks = ([{"page": 1, "chunk_index": -1, "text": summary}] if summary else []) + chunks
+    texts = ([summary] if summary else []) + [f"[{title}] {c['text']}" for c in chunks]
+    embeddings = await llm.embed(texts)
 
-    # Kick off image analysis as a fire-and-forget background task so text chunks
-    # are committed immediately without waiting for the vision model.
-    raw_images = extract_images(data, filename)
-    if raw_images:
+    # Image captioning is fire-and-forget so text chunks commit immediately.
+    if parsed["image_refs"]:
         task = asyncio.create_task(
-            _analyze_and_store_images(doc_id, title, filename, folder, raw_images)
+            _analyze_and_store_images(doc_id, title, filename, folder, parsed["image_refs"])
         )
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
-
-    all_chunks = summary_chunk_list + chunks
-    texts = ([summary] if summary else []) + [f"[{title}] {c['text']}" for c in chunks]
 
     return {
         "doc_id": doc_id,
         "filename": filename,
         "folder": folder,
+        "title": title,
+        "doc_number": doc_number,
+        "revision": revision,
         "status": "ok",
         "_chunks": all_chunks,
         "_texts": texts,
-        "_embeddings": text_embeddings,
+        "_embeddings": embeddings,
     }
 
 
-def _write(col, payload: dict) -> dict:
-    """Write one prepared payload into ChromaDB. Caller must hold _lock."""
+async def _write(payload: dict) -> dict:
+    """Write one prepared payload to the store. Caller must hold _lock."""
     doc_id = payload["doc_id"]
     filename = payload["filename"]
     if payload["status"] == "empty":
         return {"doc_id": doc_id, "filename": filename, "chunks": 0, "status": "empty"}
+
     chunks = payload["_chunks"]
     texts = payload["_texts"]
     embeddings = payload["_embeddings"]
-    existing = col.get(where={"doc_id": doc_id}, include=["metadatas"])
-    if existing["ids"]:
-        # Preserve OCR-derived image chunks — only replace text chunks
-        non_image_ids = [
-            eid for eid, emeta in zip(existing["ids"], existing["metadatas"])
-            if emeta.get("chunk_type") != "image"
-        ]
-        if non_image_ids:
-            col.delete(ids=non_image_ids)
-    ids = [f"{doc_id}_{c['page']}_{c['chunk_index']}" for c in chunks]
     folder = payload.get("folder", "General")
-    metadatas = [
-        {
+
+    # Replace text chunks, preserving image chunks written by the background pass.
+    await store.delete_doc_text_chunks(doc_id)
+
+    documents, bm_ids, bm_texts = [], [], []
+    for chunk, text, emb in zip(chunks, texts, embeddings):
+        cid = f"{doc_id}_{chunk['page']}_{chunk['chunk_index']}"
+        meta = {
             "doc_id": doc_id,
             "filename": filename,
-            "page": c["page"],
+            "page": chunk["page"],
+            # chunk_index was previously omitted from stored metadata even though
+            # several call sites read it back and silently defaulted to 0, which
+            # made "exclude summary chunks" filters no-ops. It is stored now.
+            "chunk_index": chunk["chunk_index"],
             "folder": folder,
-            **({"table_id": c["table_id"]} if c.get("table_id") else {}),
-            **({"chunk_type": c["chunk_type"]} if c.get("chunk_type") else {}),
+            "doc_number": payload.get("doc_number", "—"),
+            "revision": payload.get("revision", "—"),
         }
-        for c in chunks
-    ]
-    col.add(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
+        if chunk.get("table_id"):
+            meta["table_id"] = chunk["table_id"]
+        if chunk.get("chunk_type"):
+            meta["chunk_type"] = chunk["chunk_type"]
+        documents.append(store.to_document(cid, text, meta, emb))
+        bm_ids.append(cid)
+        bm_texts.append(f"[{filename}] {text}")
+
+    await store.add(documents)
+    bm25_index.remove_doc(doc_id)
+    bm25_index.add(bm_ids, bm_texts, {cid: folder for cid in bm_ids})
     _invalidate_cache()
-    return {"doc_id": doc_id, "filename": filename, "folder": folder, "chunks": len(chunks), "status": "ok"}
+    return {
+        "doc_id": doc_id, "filename": filename, "folder": folder,
+        "doc_number": payload.get("doc_number", "—"),
+        "revision": payload.get("revision", "—"),
+        "chunks": len(documents), "status": "ok",
+    }
 
 
 async def ingest(data: bytes, filename: str, folder: str = "General") -> dict:
     payload = await _prepare(data, filename, folder=folder)
     async with _lock:
-        col = _db()
-        result = _write(col, payload)
-        bm25_index.rebuild(col)
+        result = await _write(payload)
+        bm25_index.commit()
     return result
 
 
-async def ingest_many(files: list[tuple[bytes, str]], folder: str = "General") -> list[dict]:
-    """Ingest multiple files with concurrent parse+embed, then one write pass and one BM25 rebuild."""
-    sem = asyncio.Semaphore(_PREPARE_CONCURRENCY)
+# Files written to the store per flush. Bounds how many prepared payloads
+# (chunks + texts + 768-float embeddings) are held in RAM at once — the previous
+# implementation gathered every payload for the whole batch before writing, which
+# on a 500-file drop meant gigabytes resident on a 16 GB machine.
+_WRITE_FLUSH_EVERY = 25
+
+
+async def _run_batch(
+    files: list[tuple[bytes, str]],
+    folder: str,
+    on_prepared=None,
+) -> tuple[list[dict], list[str]]:
+    """Prepare files concurrently and flush to the store in batches.
+
+    Returns (results, errors). A file that fails to parse is recorded as an error
+    and the rest of the batch still completes — previously a single corrupt PDF
+    among hundreds raised out of `asyncio.gather` and discarded every prepared
+    payload in the job.
+    """
+    sem = asyncio.Semaphore(config.PREPARE_CONCURRENCY)
+    results: list[dict] = []
+    errors: list[str] = []
+    pending: list[dict] = []
 
     async def _bounded(data: bytes, fn: str) -> dict:
         async with sem:
-            return await _prepare(data, fn, folder=folder)
+            try:
+                payload = await _prepare(data, fn, folder=folder)
+            except Exception as exc:  # per-file isolation is the point
+                log.warning("ingest failed for %s", fn, exc_info=True)
+                payload = {"filename": fn, "status": "error", "error": str(exc)}
+            if on_prepared:
+                on_prepared()
+            return payload
 
-    payloads = await asyncio.gather(*[_bounded(data, fn) for data, fn in files])
-    async with _lock:
-        col = _db()
-        results = [_write(col, p) for p in payloads]
-        bm25_index.rebuild(col)
+    async def _flush() -> None:
+        if not pending:
+            return
+        async with _lock:
+            for payload in pending:
+                results.append(await _write(payload))
+            bm25_index.commit()
+        pending.clear()
+
+    tasks = [asyncio.create_task(_bounded(data, fn)) for data, fn in files]
+    for coro in asyncio.as_completed(tasks):
+        payload = await coro
+        if payload.get("status") == "error":
+            errors.append(f"{payload['filename']}: {payload['error']}")
+            continue
+        pending.append(payload)
+        if len(pending) >= _WRITE_FLUSH_EVERY:
+            await _flush()
+    await _flush()
+    return results, errors
+
+
+async def ingest_many(files: list[tuple[bytes, str]], folder: str = "General") -> list[dict]:
+    """Ingest multiple files with concurrent parse+embed and batched writes."""
+    results, _errors = await _run_batch(files, folder)
     return results
 
 
 async def ingest_many_tracked(files: list[tuple[bytes, str]], job, folder: str = "General") -> None:
     """Background variant of ingest_many. Updates job.prepared as each file
-    clears the embed phase, then flips job.status to done/failed at the end.
+    clears the embed phase, then flips job.status to done at the end.
 
     job.prepared is safe to increment without a lock because asyncio is
     single-threaded — only one coroutine runs at a time, and increments happen
     between awaits, so there are no races.
-    """
-    sem = asyncio.Semaphore(_PREPARE_CONCURRENCY)
 
-    async def _prepare_and_tick(data: bytes, fn: str) -> dict:
-        async with sem:
-            result = await _prepare(data, fn, folder=folder)
+    The job only fails outright on an error that is not attributable to a single
+    file; per-file failures are collected into job.errors and the rest proceed.
+    """
+    def _tick() -> None:
         job.prepared += 1
-        return result
 
     try:
-        payloads = await asyncio.gather(*[_prepare_and_tick(data, fn) for data, fn in files])
-        async with _lock:
-            col = _db()
-            job.results = [_write(col, p) for p in payloads]
-            bm25_index.rebuild(col)
+        results, errors = await _run_batch(files, folder, on_prepared=_tick)
+        job.results = results
+        job.errors.extend(errors)
         job.status = "done"
     except Exception as exc:
+        log.exception("bulk ingest job %s failed", job.id)
         job.status = "failed"
         job.errors.append(str(exc))
 
 
-def list_documents() -> list[dict]:
+async def list_documents() -> list[dict]:
+    """Document-level listing, cached until the next write.
+
+    Backed by a metadata aggregation in Qdrant rather than by pulling every
+    chunk's metadata into Python, which is what the ChromaDB version did on every
+    cache miss — a full scan of 148k payloads to produce a list of a few hundred
+    rows.
+    """
     global _doc_cache
     if _doc_cache is not None:
         return _doc_cache
-    col = _db()
-    all_meta = col.get(include=["metadatas"])["metadatas"] or []
-    seen: dict[str, dict] = {}
-    for m in all_meta:
-        doc_id = m["doc_id"]
-        if doc_id not in seen:
-            seen[doc_id] = {
-                "doc_id": doc_id,
-                "filename": m["filename"],
-                "folder": m.get("folder", "General"),
-                "chunks": 0,
-            }
-        seen[doc_id]["chunks"] += 1
-    _doc_cache = list(seen.values())
+    _doc_cache = await store.doc_summaries()
     return _doc_cache
 
 
-def list_folders() -> list[str]:
-    return sorted({d.get("folder", "General") for d in list_documents()})
+async def list_folders() -> list[str]:
+    return await store.folders()
 
 
-def move_document(doc_id: str, new_folder: str) -> int:
-    col = _db()
-    existing = col.get(where={"doc_id": doc_id}, include=["metadatas"])
-    if not existing["ids"]:
+async def move_document(doc_id: str, new_folder: str) -> int:
+    chunk_ids = list((await store.get_by_filter(store.eq("doc_id", doc_id))).keys())
+    if not chunk_ids:
         return 0
-    new_metas = [{**m, "folder": new_folder} for m in existing["metadatas"]]
-    col.update(ids=existing["ids"], metadatas=new_metas)
+    moved = await store.move_doc(doc_id, new_folder)
     _invalidate_cache()
-    bm25_index.update_folders({cid: new_folder for cid in existing["ids"]})
-    return len(existing["ids"])
+    bm25_index.update_folders({cid: new_folder for cid in chunk_ids})
+    return moved
 
 
-def delete_document(doc_id: str) -> int:
-    col = _db()
-    existing = col.get(where={"doc_id": doc_id})
-    if existing["ids"]:
-        col.delete(ids=existing["ids"])
+def _remove_files(doc_id: str) -> None:
+    for path in glob.glob(os.path.join(config.ORIGINALS_DIR, f"{doc_id}.*")):
+        os.remove(path)
+    img_dir = os.path.join(config.IMAGES_DIR, doc_id)
+    if os.path.isdir(img_dir):
+        for name in os.listdir(img_dir):
+            os.remove(os.path.join(img_dir, name))
+        os.rmdir(img_dir)
+
+
+async def delete_document(doc_id: str) -> int:
+    removed = await store.delete_doc(doc_id)
+    if removed:
         _invalidate_cache()
-        bm25_index.rebuild(col)
-        for path in glob.glob(os.path.join(config.ORIGINALS_DIR, f"{doc_id}.*")):
-            os.remove(path)
-    return len(existing["ids"])
+        # Targeted removal — no full corpus re-tokenisation for one deleted file.
+        bm25_index.remove_doc(doc_id)
+        bm25_index.commit()
+        _remove_files(doc_id)
+    return removed
 
 
-def clear_all_documents() -> int:
-    global _chroma
-    col = _db()
-    count = col.count()
-    if count == 0:
-        return 0
-    _client().delete_collection("docs")
-    _chroma = _client().create_collection("docs", metadata={"hnsw:space": "cosine"})
+async def clear_all_documents() -> int:
+    count = await store.clear()
     _invalidate_cache()
-    bm25_index.rebuild(_chroma)
+    bm25_index.clear()
     for path in glob.glob(os.path.join(config.ORIGINALS_DIR, "*")):
         os.remove(path)
+    if os.path.isdir(config.IMAGES_DIR):
+        for doc_dir in os.listdir(config.IMAGES_DIR):
+            full = os.path.join(config.IMAGES_DIR, doc_dir)
+            if os.path.isdir(full):
+                for name in os.listdir(full):
+                    os.remove(os.path.join(full, name))
+                os.rmdir(full)
     return count

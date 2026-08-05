@@ -1,16 +1,30 @@
 import asyncio
 import json
 import logging
+
 import httpx
+
 import config
 
 log = logging.getLogger(__name__)
 
+# trust_env=False is a hard air-gap requirement, not a preference. httpx honours
+# HTTP_PROXY / HTTPS_PROXY / ALL_PROXY from the environment by default, so on any
+# machine with a corporate proxy configured, every prompt and document excerpt
+# sent to "localhost" Ollama would instead be routed through that proxy — data
+# leaving the machine. It also stops httpx reading ~/.netrc and SSL_CERT_FILE.
 _client    = httpx.AsyncClient(
     base_url=config.OLLAMA_BASE,
     timeout=httpx.Timeout(connect=10.0, read=600.0, write=10.0, pool=10.0),
+    trust_env=False,
 )
 _embed_sem = asyncio.Semaphore(config.EMBED_CONCURRENCY)
+# Ollama serialises generation on CPU-only hardware, so firing N concurrent chat
+# requests does not make them finish faster — it just multiplies peak RAM and
+# makes every one of them slower. Ingest fans out to _PREPARE_CONCURRENCY=16
+# files, each of which may need an LLM summary; without this bound that is 16
+# simultaneous generations on a 16 GB box.
+_chat_sem  = asyncio.Semaphore(config.CHAT_CONCURRENCY)
 
 
 def _build_messages(system: str, user: str, history: list[dict] | None) -> list[dict]:
@@ -42,18 +56,19 @@ async def chat(
     model: str | None = None,
     history: list[dict] | None = None,
 ) -> str:
-    r = await _client.post(
-        "/api/chat",
-        json={
-            "model": model or config.CHAT_MODEL,
-            "stream": False,
-            "keep_alive": -1,
-            "think": False,
-            "messages": _build_messages(system, user, history),
-        },
-    )
-    r.raise_for_status()
-    return r.json()["message"]["content"]
+    async with _chat_sem:
+        r = await _client.post(
+            "/api/chat",
+            json={
+                "model": model or config.CHAT_MODEL,
+                "stream": False,
+                "keep_alive": -1,
+                "think": False,
+                "messages": _build_messages(system, user, history),
+            },
+        )
+        r.raise_for_status()
+        return r.json()["message"]["content"]
 
 
 async def chat_stream(
@@ -62,7 +77,13 @@ async def chat_stream(
     model: str | None = None,
     history: list[dict] | None = None,
 ):
-    """Async generator that yields tokens from a streaming Ollama response."""
+    """Async generator that yields tokens from a streaming Ollama response.
+
+    Deliberately NOT gated by _chat_sem: this is the interactive answer path, and
+    queueing a user's question behind a bulk ingest's summary generations would
+    make the UI appear frozen for minutes. Only batch/background callers (which
+    go through chat()) are bounded.
+    """
     async with _client.stream(
         "POST",
         "/api/chat",
@@ -89,3 +110,8 @@ async def reachable() -> bool:
         return r.is_success
     except Exception:
         return False
+
+
+async def aclose() -> None:
+    """Close the shared HTTP client. Called from the FastAPI lifespan shutdown."""
+    await _client.aclose()
