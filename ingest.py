@@ -991,8 +991,8 @@ async def list_documents() -> list[dict]:
 
     Backed by a metadata aggregation in Qdrant rather than by pulling every
     chunk's metadata into Python, which is what the ChromaDB version did on every
-    cache miss — a full scan of 148k payloads to produce a list of a few hundred
-    rows.
+    cache miss — a full scan of every chunk payload to produce a list of a few
+    dozen rows.
     """
     global _doc_cache
     if _doc_cache is not None:

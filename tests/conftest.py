@@ -4,7 +4,7 @@ Shared fixtures. Ollama is mocked so tests run without a real GPU/server.
 Each test gets its own Qdrant store in a unique tmp_path. Tests use the Qdrant
 client's *local* mode (`path=...`), which needs no running server. That mode is
 brute-force and capped at roughly 20k points, which is unsuitable for the real
-148k-chunk corpus — production uses the server, see store.py — but it is exactly
+real corpus — production uses the server, see store.py — but it is exactly
 right for a test fixture holding a handful of documents, and it exercises the same
 client API surface.
 """

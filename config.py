@@ -65,7 +65,8 @@ BM25_PATH = os.path.join(DATA_DIR, "bm25_index.pkl")
 # Embedded mode (QdrantDocumentStore(path=...)) is deliberately NOT used: the
 # Qdrant client's local mode is brute-force only, documented as suitable for
 # <20k points, and raises RuntimeError on concurrent access to the same path.
-# The production corpus is ~148k chunks, so it needs the real HNSW index.
+# The production corpus is well past that ceiling (~35k chunks measured), so it
+# needs the real HNSW index.
 QDRANT_HOST    = os.environ.get("GEO_QDRANT_HOST", "127.0.0.1")
 QDRANT_PORT    = int(os.environ.get("GEO_QDRANT_PORT", "6333"))
 QDRANT_STORAGE = os.path.join(DATA_DIR, "qdrant")

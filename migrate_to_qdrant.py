@@ -1,7 +1,7 @@
 """One-off migration: ChromaDB → Qdrant.
 
 Copies every chunk out of the legacy `data/chroma_db` collection and into Qdrant,
-**reusing the stored embedding vectors** — nothing is re-embedded, so a 148k-chunk
+**reusing the stored embedding vectors** — nothing is re-embedded, so a large
 corpus migrates in minutes rather than the hours a full re-ingest would take.
 
 Usage

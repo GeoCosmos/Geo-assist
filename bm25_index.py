@@ -26,7 +26,7 @@ Incrementality
 The previous implementation re-fetched every chunk from the vector store, re-ran
 the Snowball stemmer over the whole corpus, and rebuilt the index from scratch on
 *every single ingest and delete*. Ingesting 500 files one at a time meant 500 full
-rebuilds — O(n×batches), hours on a 148k-chunk corpus.
+rebuilds — O(n×batches), and the dominant cost of any large ingest.
 
 Now the tokenised corpus is held in memory and persisted alongside the index, so
 adding or removing a document only tokenises the chunks that actually changed.
@@ -208,8 +208,8 @@ class BM25Index:
                top_k: int | None = None) -> list[tuple[str, float]]:
         """Return (chunk_id, bm25_score) best-first, optionally folder-filtered.
 
-        `top_k` uses a heap instead of sorting the full corpus. At 148k chunks a
-        full sort per query costs ~100 ms for a top-30 result that needs none of it.
+        `top_k` uses a heap instead of sorting the full corpus. At tens of thousands
+        of chunks a full sort per query is wasted work for a top-30 result.
         """
         pairs = self._scored(query)
         if pairs is None:

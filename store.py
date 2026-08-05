@@ -19,7 +19,9 @@ Server, not embedded
 `QdrantDocumentStore` also supports an embedded mode (`path=...`). It is not used:
 that mode is brute-force only, documented as suitable for under ~20k points, and
 raises RuntimeError on concurrent access to the same path. The production corpus
-is ~148k chunks. The start scripts launch a loopback-bound `qdrant` server.
+was ~35k chunks when last measured (34,809 across 16 documents, Aug 2026 —
+earlier notes claimed 148k, which the database did not bear out). Still well past
+the local-mode ceiling. The start scripts launch a loopback-bound `qdrant` server.
 
 Chunk IDs
 ─────────
@@ -84,8 +86,8 @@ def get_store() -> QdrantDocumentStore:
             index=config.QDRANT_INDEX,
             embedding_dim=config.EMBED_DIM,
             similarity="cosine",
-            # Keep payloads on disk; the 16 GB target machine cannot hold 148k
-            # chunk texts in RAM alongside Ollama's resident models.
+            # Keep payloads on disk; the 16 GB target machine should not hold tens
+            # of thousands of chunk texts in RAM alongside Ollama's resident models.
             on_disk_payload=True,
             hnsw_config={"m": 16, "ef_construct": 100, "on_disk": False},
             payload_fields_to_index=config.QDRANT_INDEXED_FIELDS,
@@ -249,7 +251,7 @@ async def doc_summaries() -> list[dict]:
 
     Built from the summary chunk (`{doc_id}_1_-1`) plus a per-doc chunk count,
     rather than by scanning every chunk's metadata as the Chroma version did. On
-    a 148k-chunk corpus that scan pulled the entire payload set into memory on
+    a corpus this size that scan pulled the entire payload set into memory on
     every cache miss.
     """
     store = get_store()

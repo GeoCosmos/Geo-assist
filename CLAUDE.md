@@ -229,6 +229,24 @@ Both scripts defer `bm25_index.commit()` to a single call at the end (not after 
 
 **BM25 is now incremental.** `bm25_index` keeps the tokenised corpus in memory and persists it alongside the index, so adding or deleting a document only tokenises the chunks that changed. `add()` / `remove_doc()` mark the index dirty; `commit()` re-fits and saves. The old `rebuild(col)` re-read the entire corpus from the database and re-ran the Snowball stemmer over every chunk on *every single ingest and delete* — ingesting 500 files one at a time meant 500 full rebuilds. `rebuild_from_store()` still exists but is only the cold-start fallback; keep it off the hot path.
 
+## Benchmarking
+
+`benchmark_models.py` compares chat models on **latency and stability** — no labelled
+answers required. Retrieval runs once per question and the identical context is
+replayed to every model, so the numbers reflect the model, not retrieval jitter.
+
+```bash
+python3 benchmark_models.py --models qwen3.5:4b llama3.1:8b --runs 3
+python3 benchmark_models.py --questions my_questions.txt --out results.md
+```
+
+The column that matters is **numeric drift**: every number+unit in each answer is
+extracted and compared across repeat runs of the same question. A model that
+answers "28 V" once and "24 V" the next time is unusable for spec lookups no
+matter how fast it is — which is exactly how `llama3.1:8b` and `llama3.2` were
+disqualified. Treat near-zero drift as the entry requirement and speed as the
+tiebreak, not the other way round.
+
 ## Linting
 
 ```powershell
@@ -247,7 +265,7 @@ ruff check --fix .
 
 Qdrant runs as a **server process**, started by the platform start script and bound to `127.0.0.1`. The binary is not committed (~30 MB) — download `qdrant-x86_64-pc-windows-msvc.zip` (or the matching platform build) from https://github.com/qdrant/qdrant/releases and unpack it to `./qdrant/`. On an air-gapped machine, copy it across alongside the release zip.
 
-**Embedded mode is deliberately not used.** `QdrantDocumentStore(path=...)` runs in the client's local mode, which is brute-force only (no HNSW), documented as suitable for under ~20k points, and raises `RuntimeError` on concurrent access to the same path. The production corpus is ~148k chunks. The **test suite does** use local mode — a handful of documents per test, no server needed, same client API.
+**Embedded mode is deliberately not used.** `QdrantDocumentStore(path=...)` runs in the client's local mode, which is brute-force only (no HNSW), documented as suitable for under ~20k points, and raises `RuntimeError` on concurrent access to the same path. The production corpus is well past that ceiling (34,809 chunks across 16 documents when last measured; earlier notes claimed 148k, which the database did not bear out). The **test suite does** use local mode — a handful of documents per test, no server needed, same client API.
 
 Chunk IDs keep the `{doc_id}_{page}_{chunk_index}` scheme. Qdrant only accepts UUID/int point IDs, but the Haystack integration maps each string ID through a deterministic uuid5 and keeps the original in the payload, so ID-derived logic (`endswith("_1_-1")`, neighbour reconstruction) is unaffected.
 
