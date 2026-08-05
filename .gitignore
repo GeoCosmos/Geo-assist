@@ -55,3 +55,6 @@ htmlcov/
 # Eval output
 geo-assist-eval/
 data/to_ingest/
+
+# Runtime marker written by the start scripts
+.qdrant-initialized

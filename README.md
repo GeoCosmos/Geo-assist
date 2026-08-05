@@ -25,12 +25,30 @@ ollama pull nomic-embed-text
 ollama pull qwen3.5:4b      # default chat model
 ```
 
-**A C compiler** — needed because `chromadb`, `sentence-transformers`, and `easyocr` may build native extensions if no prebuilt wheel matches your Python version.
+**Qdrant** — the vector database. It runs as a local server bound to `127.0.0.1`; nothing is exposed to the network. The binary is not bundled (~30 MB), so download it once from the [Qdrant releases page](https://github.com/qdrant/qdrant/releases) and unpack it into a `qdrant/` folder next to the start script:
+
+| OS | Asset | Resulting path |
+|---|---|---|
+| Windows | `qdrant-x86_64-pc-windows-msvc.zip` | `qdrant\qdrant.exe` |
+| macOS (Apple Silicon) | `qdrant-aarch64-apple-darwin.tar.gz` | `qdrant/qdrant` |
+| macOS (Intel) | `qdrant-x86_64-apple-darwin.tar.gz` | `qdrant/qdrant` |
+| Linux | `qdrant-x86_64-unknown-linux-gnu.tar.gz` | `qdrant/qdrant` |
+
+On macOS and Linux, make it executable — and on macOS clear the quarantine flag, or Gatekeeper will kill it silently and the start script will just report a timeout:
+
+```bash
+chmod +x qdrant/qdrant
+xattr -dr com.apple.quarantine qdrant/qdrant   # macOS only
+```
+
+On an air-gapped machine, copy the binary across alongside the release zip. The start script launches and stops Qdrant for you; if one is already running on the port it leaves it alone.
+
+**A C compiler** — needed because `sentence-transformers` and `easyocr` (both optional) may build native extensions if no prebuilt wheel matches your Python version.
 - Windows: Visual Studio Build Tools (C++ workload)
 - macOS: Xcode Command Line Tools (`xcode-select --install`)
 - Linux: `build-essential` (apt) or `gcc` + `python3-devel` (dnf)
 
-**Python 3.11+** with dependencies:
+**Python 3.10+** with dependencies:
 
 ```bash
 pip install -r requirements.txt
@@ -48,7 +66,7 @@ Windows Visual Studio C++ download:
 
 Double-click `start.bat`, or right-click → Run with PowerShell.
 
-`start.ps1` auto-detects your CPU core count and NVIDIA GPU, checks for Ollama and C++ Build Tools (offering to install either via winget if missing), sets Ollama thread/GPU parameters accordingly, verifies models are pulled, installs Python dependencies, and opens the browser when ready.
+`start.ps1` auto-detects your CPU core count and NVIDIA GPU, checks for Ollama and C++ Build Tools (offering to install either via winget if missing), sets Ollama thread/GPU parameters accordingly, verifies models are pulled, starts the local Qdrant server, installs Python dependencies, and opens the browser when ready. On exit it stops the server it started.
 
 To override settings before launching:
 
@@ -63,7 +81,7 @@ $env:GEO_CHAT_MODEL   = "qwen3.5:4b"
 ./start_mac.sh
 ```
 
-`start_mac.sh` checks for Ollama (offering `brew install ollama` if missing) and Xcode Command Line Tools, verifies models are pulled, installs Python dependencies, and opens the browser when ready.
+`start_mac.sh` checks for Ollama (offering `brew install ollama` if missing) and Xcode Command Line Tools, verifies models are pulled, starts the local Qdrant server, installs Python dependencies, and opens the browser when ready.
 
 Or run it manually:
 
@@ -77,7 +95,7 @@ GEO_CHAT_MODEL=qwen3.5:4b python3 -m uvicorn main:app --host 127.0.0.1 --port 87
 ./start_linux.sh
 ```
 
-`start_linux.sh` checks for Ollama (offering the official install script if missing) and a C compiler (offering an apt/dnf install if missing), verifies models are pulled, installs Python dependencies, and opens the browser when ready.
+`start_linux.sh` checks for Ollama (offering the official install script if missing) and a C compiler (offering an apt/dnf install if missing), verifies models are pulled, starts the local Qdrant server, installs Python dependencies, and opens the browser when ready.
 
 Or run it manually:
 
@@ -116,8 +134,14 @@ All settings are in `config.py`. Key environment variables:
 | `GEO_CHAT_MODEL` | `qwen3.5:4b` | Ollama chat model |
 | `GEO_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model |
 | `GEO_EMBED_CONCURRENCY` | `2` | Parallel embedding requests (raise to `4` with a GPU) |
+| `GEO_PREPARE_CONCURRENCY` | `min(8, cores)` | Files parsed in parallel during ingest. Lower it if ingest is straining memory |
+| `GEO_KEEP_ALIVE` | `5m` | How long Ollama keeps a model in RAM after last use. `-1` never unloads (fast, memory-hungry), `0` unloads immediately |
 | `GEO_OCR` | `false` | Set to `true` to enable OCR text extraction from images |
 | `GEO_QUERY_EXPANSION` | `false` | Enable multi-query expansion (+20s latency, better cross-doc accuracy) |
+| `GEO_RERANK` | `true` | Cross-encoder reranking. Needs `requirements-reranker.txt` and a pre-downloaded model; falls back silently if absent |
+| `GEO_QDRANT_PORT` | `6333` | Port the local Qdrant server listens on |
+
+On a 16 GB machine running low on memory during ingest, `GEO_PREPARE_CONCURRENCY=2` is the first knob to reach for.
 
 ## Bulk re-indexing
 
@@ -136,8 +160,13 @@ python3 resume_reindex.py --dir ~/Desktop/my-docs
 
 ## Running tests
 
-Tests run fully offline — no Ollama or GPU required:
+Tests run fully offline — no Ollama, GPU, or running Qdrant server required. Ollama
+is mocked with deterministic fakes and the store runs in Qdrant's embedded mode.
 
 ```bash
 python3 -m pytest tests/ -v
 ```
+
+They cover pipeline logic and the air-gap guarantees (`tests/test_airgap.py`), not
+real-world speed or answer quality. For those, use `benchmark_models.py` against a
+running instance with documents ingested.
