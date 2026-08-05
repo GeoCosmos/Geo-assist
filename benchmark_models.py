@@ -205,6 +205,13 @@ async def benchmark(models: list[str], questions: list[str], runs: int) -> dict:
             if attempts:
                 per_question[q] = attempts
 
+        footprint = await model_footprint(model)
+        # Evict before moving to the next model. Without this a sweep across
+        # several models leaves every one of them resident, which on a 16 GB
+        # machine means swapping long before the sweep finishes.
+        await llm.unload(model)
+        print(f"  unloaded {model}")
+
         if not per_question:
             continue
         flat = [r for rs in per_question.values() for r in rs]
@@ -215,7 +222,7 @@ async def benchmark(models: list[str], questions: list[str], runs: int) -> dict:
             "refusal_rate": sum(r["refused"] for r in flat) / len(flat),
             "drift": statistics.mean(drift_score(rs) for rs in per_question.values()),
             "len_cv": statistics.mean(_cv([r["chars"] for r in rs]) for rs in per_question.values()),
-            "footprint": await model_footprint(model),
+            "footprint": footprint,
             "n": len(flat),
             "raw": {q: [{k: v for k, v in r.items() if k != "values"} for r in rs]
                     for q, rs in per_question.items()},

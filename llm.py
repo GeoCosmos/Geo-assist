@@ -42,7 +42,7 @@ async def embed(texts: list[str], prefix: str = "search_document") -> list[list[
 
     async def _embed_batch(batch: list[str]) -> list[list[float]]:
         async with _embed_sem:
-            r = await _client.post("/api/embed", json={"model": config.EMBED_MODEL, "input": batch, "keep_alive": -1})
+            r = await _client.post("/api/embed", json={"model": config.EMBED_MODEL, "input": batch, "keep_alive": config.KEEP_ALIVE})
             r.raise_for_status()
             return r.json()["embeddings"]
 
@@ -62,7 +62,7 @@ async def chat(
             json={
                 "model": model or config.CHAT_MODEL,
                 "stream": False,
-                "keep_alive": -1,
+                "keep_alive": config.KEEP_ALIVE,
                 "think": False,
                 "messages": _build_messages(system, user, history),
             },
@@ -90,7 +90,7 @@ async def chat_stream(
         json={
             "model": model or config.CHAT_MODEL,
             "stream": True,
-            "keep_alive": -1,
+            "keep_alive": config.KEEP_ALIVE,
             "think": False,
             "messages": _build_messages(system, user, history),
         },
@@ -109,6 +109,21 @@ async def reachable() -> bool:
         r = await _client.get("/api/tags", timeout=10.0)
         return r.is_success
     except Exception:
+        return False
+
+
+async def unload(model: str) -> bool:
+    """Evict a model from Ollama's memory immediately.
+
+    `keep_alive: 0` tells Ollama to drop the model as soon as the (empty) request
+    completes. Used by the benchmark between models so a multi-model sweep does
+    not accumulate every model it has touched in RAM.
+    """
+    try:
+        r = await _client.post("/api/generate", json={"model": model, "keep_alive": 0})
+        return r.is_success
+    except Exception:
+        log.warning("could not unload %s", model, exc_info=True)
         return False
 
 

@@ -46,6 +46,18 @@ EMBED_CONCURRENCY  = int(os.environ.get("GEO_EMBED_CONCURRENCY",  "2"))
 # field extraction, query expansion, procedure synthesis). Ollama serialises
 # generation on CPU, so >1 buys nothing and costs RAM. Raise only on GPU hardware.
 CHAT_CONCURRENCY   = int(os.environ.get("GEO_CHAT_CONCURRENCY",   "1"))
+# How long Ollama keeps a model resident after its last use.
+#
+# This was hard-coded to -1 (never unload) at every call site, to avoid the ~30s
+# cold load on the first query. On a 16 GB machine that is too aggressive: the
+# chat model and the embedding model both pin themselves permanently, and running
+# a second model — a benchmark sweep, or switching GEO_CHAT_MODEL — stacks on top
+# rather than replacing. The machine ends up swapping.
+#
+# "5m" keeps an active session warm while letting an idle machine reclaim the RAM.
+# Set GEO_KEEP_ALIVE=-1 to restore the always-resident behaviour on a box with
+# RAM to spare, or 0 to unload immediately after every call.
+KEEP_ALIVE = os.environ.get("GEO_KEEP_ALIVE", "5m")
 # Files parsed+embedded concurrently during bulk ingest. Parsing now runs in a
 # thread pool, so this maps to real cores rather than to blocked event-loop time.
 PREPARE_CONCURRENCY = int(os.environ.get("GEO_PREPARE_CONCURRENCY", str(min(8, (os.cpu_count() or 4)))))

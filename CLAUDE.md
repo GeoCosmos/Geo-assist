@@ -343,4 +343,21 @@ Step-by-step procedure walkthrough is implemented within the main agent (no sepa
 - `/procedure/session/{id}/start`, `/navigate`, `DELETE` in `main.py`; state stored in `_proc_sessions`
 - `#proc-bar` in `static/index.html`; JS state in `_procState`
 
-**Do not** set `keep_alive: -1` unconditionally if targeting machines where RAM is tight. The current value keeps models loaded permanently; consider `keep_alive: 300` (5-minute idle unload) as an alternative.
+## Model residency
+
+`config.KEEP_ALIVE` (env `GEO_KEEP_ALIVE`, default `"5m"`) controls how long Ollama
+keeps a model in RAM after its last use. It is passed on every Ollama call in
+`llm.py`.
+
+This was previously hard-coded to `-1` — never unload — at all three call sites, to
+dodge the ~30s cold load on first query. On a 16 GB machine that is too aggressive:
+the chat model and the embedding model each pin themselves permanently, and any
+second model (a benchmark sweep, or changing `GEO_CHAT_MODEL`) stacks on top rather
+than replacing, until the machine swaps.
+
+`"5m"` keeps an active session warm and lets an idle machine reclaim the memory.
+Set `GEO_KEEP_ALIVE=-1` to restore always-resident behaviour where RAM allows, or
+`0` to unload after every call.
+
+`llm.unload(model)` evicts a model immediately; `benchmark_models.py` calls it
+between models so a sweep does not accumulate all of them.
