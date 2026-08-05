@@ -54,3 +54,4 @@ htmlcov/
 
 # Eval output
 geo-assist-eval/
+data/to_ingest/
