@@ -1,38 +1,53 @@
 """
 Shared fixtures. Ollama is mocked so tests run without a real GPU/server.
-Each test gets its own PersistentClient in a unique tmp_path for true isolation
-(EphemeralClient shares in-process state across tests).
+
+Each test gets its own Qdrant store in a unique tmp_path. Tests use the Qdrant
+client's *local* mode (`path=...`), which needs no running server. That mode is
+brute-force and capped at roughly 20k points, which is unsuitable for the real
+real corpus — production uses the server, see store.py — but it is exactly
+right for a test fixture holding a handful of documents, and it exercises the same
+client API surface.
 """
 import os
 import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import chromadb
 import pytest
 import pytest_asyncio
+from haystack_integrations.document_stores.qdrant import QdrantDocumentStore
+
 import bm25_index
 import config
 import ingest
+import store
 
 
 @pytest.fixture(autouse=True)
-def fresh_chroma(tmp_path, monkeypatch):
-    """Give every test its own isolated ChromaDB and BM25 path via a temp directory."""
-    client = chromadb.PersistentClient(path=str(tmp_path / "chroma"))
-    col = client.get_or_create_collection("docs", metadata={"hnsw:space": "cosine"})
-    monkeypatch.setattr(ingest, "_chroma_client", client)
-    monkeypatch.setattr(ingest, "_chroma", col)
-    monkeypatch.setattr(ingest, "_doc_cache", None)
+def fresh_store(tmp_path, monkeypatch):
+    """Give every test an isolated Qdrant store, BM25 index, and data directories."""
     monkeypatch.setattr(config, "BM25_PATH", str(tmp_path / "bm25_index.pkl"))
     monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path / "originals"))
+    monkeypatch.setattr(config, "IMAGES_DIR", str(tmp_path / "images"))
+    # Parsing in a subprocess pool would not see these monkeypatched paths, and
+    # spawning processes per test is slow. Run parse work inline instead.
+    monkeypatch.setattr(ingest, "_pool", lambda: None)
+
+    qdrant = QdrantDocumentStore(
+        path=str(tmp_path / "qdrant"),
+        index="test_docs",
+        embedding_dim=768,
+        similarity="cosine",
+        recreate_index=True,
+        progress_bar=False,
+    )
+    store.reset_store(qdrant)
+    ingest._doc_cache = None
     bm25_index._index.build([], [])   # reset BM25 between tests
-    yield col
-    ingest._chroma_client = None
-    ingest._chroma = None
+    yield qdrant
+    store.reset_store(None)
     ingest._doc_cache = None
     bm25_index._index.build([], [])
-    client._system.stop()
-    client.clear_system_cache()
 
 
 def make_embedding(text: str, dim: int = 768) -> list[float]:

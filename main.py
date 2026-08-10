@@ -13,19 +13,34 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import bm25_index
 import config
 import ingest
 import jobs
 import llm
 import retriever
+import store
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+log = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    os.makedirs(config.DATA_DIR, exist_ok=True)
     await llm.embed(["warmup"], prefix="search_query")
+    # Load the keyword index once at boot rather than lazily on the first query,
+    # so the first user of the day does not pay a cold-start rebuild.
+    try:
+        await bm25_index.load_or_rebuild()
+    except Exception:  # the app is still usable on semantic search alone
+        log.warning("BM25 index unavailable at startup", exc_info=True)
     yield
+    # Ordered shutdown: stop accepting parse work, then close network clients.
+    ingest.shutdown_pool()
+    await store.aclose()
+    await llm.aclose()
 
 
 app = FastAPI(title="Geo-Assist", lifespan=lifespan)
@@ -42,13 +57,14 @@ async def index():
 @app.get("/health")
 async def health():
     ok = await llm.reachable()
-    col = ingest._db()
+    db = await store.health()
     return {
-        "status": "ok" if ok else "degraded",
+        "status": "ok" if (ok and db["reachable"]) else "degraded",
         "ollama": ok,
+        "qdrant": db["reachable"],
         "chat_model": config.CHAT_MODEL,
         "embed_model": config.EMBED_MODEL,
-        "chunks_stored": col.count(),
+        "chunks_stored": db["chunks_stored"],
     }
 
 
@@ -135,12 +151,12 @@ async def ingest_status(job_id: str):
 
 @app.get("/documents")
 async def list_documents():
-    return {"documents": ingest.list_documents()}
+    return {"documents": await ingest.list_documents()}
 
 
 @app.get("/folders")
 async def list_folders():
-    return {"folders": ingest.list_folders()}
+    return {"folders": await ingest.list_folders()}
 
 
 class MoveFolderRequest(BaseModel):
@@ -149,7 +165,7 @@ class MoveFolderRequest(BaseModel):
 
 @app.patch("/documents/{doc_id}/folder")
 async def move_document_folder(doc_id: str, req: MoveFolderRequest):
-    moved = ingest.move_document(doc_id, _safe_folder(req.folder))
+    moved = await ingest.move_document(doc_id, _safe_folder(req.folder))
     if moved == 0:
         raise HTTPException(404, "Document not found")
     return {"moved_chunks": moved}
@@ -170,7 +186,8 @@ async def get_document_file(doc_id: str):
 
 @app.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str):
-    removed = ingest.delete_document(doc_id)
+    async with ingest._lock:
+        removed = await ingest.delete_document(doc_id)
     if removed == 0:
         raise HTTPException(404, "Document not found")
     return {"removed_chunks": removed}
@@ -179,7 +196,7 @@ async def delete_document(doc_id: str):
 @app.delete("/documents")
 async def clear_all_documents():
     async with ingest._lock:
-        removed = ingest.clear_all_documents()
+        removed = await ingest.clear_all_documents()
     return {"removed_chunks": removed}
 
 
@@ -273,18 +290,16 @@ async def clear_session(session_id: str):
 
 @app.post("/procedure/session/{session_id}/start")
 async def procedure_start(session_id: str, req: ProcedureStartRequest):
-    col = ingest._db()
-    result = col.get(where={"doc_id": req.doc_id}, include=["documents", "metadatas"])
-    if not result["ids"]:
+    hits = await store.get_doc_chunks(req.doc_id)
+    if not hits:
         raise HTTPException(404, "Document not found")
-    filename = result["metadatas"][0]["filename"]
-    # Sort by page then chunk_index; exclude image/summary chunks (chunk_index < 0)
-    paired = sorted(
-        zip(result["ids"], result["documents"], result["metadatas"]),
-        key=lambda x: (x[2]["page"], x[2].get("chunk_index", 0)),
-    )
+    filename = next(iter(hits.values()))[1]["filename"]
+    # Sort by page then chunk_index; exclude image/summary chunks (chunk_index < 0).
+    # This filter only became effective once chunk_index was actually persisted —
+    # it previously defaulted to 0 for every chunk and excluded nothing.
+    paired = sorted(hits.items(), key=lambda kv: (kv[1][1]["page"], kv[1][1].get("chunk_index", 0)))
     chunks = [
-        doc for _, doc, meta in paired
+        text for _, (text, meta, _dist) in paired
         if meta.get("chunk_index", 0) >= 0 and meta.get("chunk_type", "") != "image"
     ]
     steps = await retriever._generate_procedure_steps(chunks)

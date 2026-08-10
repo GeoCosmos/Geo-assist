@@ -1,9 +1,10 @@
 """Tests for FastAPI endpoints."""
 import json
-from unittest.mock import patch, AsyncMock
-from fastapi.testclient import TestClient
-import main
+from unittest.mock import AsyncMock, patch
 
+from fastapi.testclient import TestClient
+
+import main
 
 client = TestClient(main.app)
 

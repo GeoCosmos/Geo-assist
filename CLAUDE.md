@@ -42,8 +42,9 @@ call sites.
 ## Stack
 
 - **Backend**: Python FastAPI on port 8743
-- **Vector store**: ChromaDB (local persistent, `./data/chroma_db/`)
-- **Keyword index**: BM25 via `rank-bm25` (in-memory, rebuilt on every ingest/delete)
+- **Vector store**: Qdrant, running as a local loopback-bound server process (`./qdrant/qdrant[.exe]`, storage in `./data/qdrant/`), accessed through Haystack's `QdrantDocumentStore`. All persistence goes through `store.py` — no other module talks to the database.
+- **Orchestration**: Haystack (`haystack-ai`) for the document store, `Document` type, and retrieval plumbing. The domain-specific pipeline logic (table completeness, parent-chunk expansion, named-doc injection, procedure mode) stays as plain Python in `retriever.py` rather than as custom Haystack components.
+- **Keyword index**: BM25 via `rank-bm25` (in-memory, persisted to `./data/bm25_index.pkl`, updated **incrementally**)
 - **Embeddings**: Ollama `nomic-embed-text` with `search_document:` / `search_query:` task prefixes
 - **Chat model**: Ollama `qwen3.5:4b` (override with `GEO_CHAT_MODEL`)
 - **Frontend**: Single static HTML file (`static/index.html`) — no build step, no Node.js, no CDN dependencies (air-gapped safe)
@@ -63,9 +64,12 @@ call sites.
 3. Sets `OLLAMA_NUM_THREADS`, `OLLAMA_NUM_GPU`, concurrency tuning per hardware
 4. Sets `OLLAMA_MAX_LOADED_MODELS=2` — keeps both chat and embed models resident simultaneously (prevents 30s cold-load latency on first query)
 5. Verifies / pulls required Ollama models
-6. Installs Python deps
-7. Starts uvicorn with `--loop asyncio --workers 1`
-8. Opens browser when ready
+6. Starts the Qdrant server on `127.0.0.1:6333` (skipped if one is already running) and waits for `/readyz`
+7. Installs Python deps
+8. Starts uvicorn with `--loop asyncio --workers 1`
+9. Opens browser when ready
+
+On exit it stops uvicorn, and stops Qdrant **only if it started it** — a pre-existing instance is left alone.
 
 Override any setting before running:
 ```powershell
@@ -105,14 +109,15 @@ GEO_CHAT_MODEL=qwen3.5:4b python3 -m uvicorn main:app --host 127.0.0.1 --port 87
 
 Pushing a tag matching `v*` (e.g. `git tag v1.1.0 && git push origin v1.1.0`) triggers `.github/workflows/release.yml`, which zips the repo three times via `git archive` and publishes them to a GitHub Release. Each zip is trimmed to runtime-only files via `git archive` pathspec excludes (`:(exclude)path`):
 
-- `COMMON_EXCLUDES` drops dev-only paths from all three zips — `tests/`, `docs/`, `.github/`, `CLAUDE.md`, `pytest.ini`, `.gitignore`, `backfill_summaries.py` (a one-off migration script, not part of the app).
+- `COMMON_EXCLUDES` drops dev-only paths from all three zips — `tests/`, `docs/`, `.github/`, `CLAUDE.md`, `pytest.ini`, `.gitignore`, `migrate_to_qdrant.py` (a one-off migration script, not part of the app), and `handoff.md` (internal notes — gitignored, but excluded explicitly so it cannot ship if ever committed).
+- The Qdrant binary is **not** in the repo or the zips. Ship `qdrant/qdrant[.exe]` alongside the release archive, or have the target machine download it once.
 - Per-OS excludes drop the other OSes' start scripts — `geo-assist-windows-*.zip` ships only `start.bat`/`start.ps1`, `geo-assist-macos-*.zip` only `start_mac.sh`, `geo-assist-linux-*.zip` only `start_linux.sh`.
 
 Anyone needing the full source (including tests/docs) should use GitHub's automatic per-tag "Source code (zip/tar.gz)" links, which always ship everything — no workflow change needed for that. Add new dev-only or OS-specific files to the relevant exclude list in the workflow to keep them out of the runtime zips.
 
 ### OCR support (optional)
 
-OCR extracts text from images embedded in documents (screenshots, UI captures, text-heavy figures) in sub-second time. Images with sparse OCR output (diagrams, schematics) are dropped — there is no vision-model fallback.
+OCR extracts text from images embedded in documents (screenshots, UI captures, text-heavy figures) in sub-second time. Images with sparse OCR output (diagrams, schematics) are **kept but left uncaptioned** (`caption_status="pending"`) — there is no vision-model fallback yet, but the image bytes are on disk so one can be added without re-ingesting.
 
 To enable:
 ```bash
@@ -142,11 +147,13 @@ python3 -m pytest tests/test_retriever.py -v
 ```
 geo-assist/
 ├── main.py          FastAPI app + routes + static serving
-├── config.py        All tunable constants
-├── llm.py           Async Ollama wrappers (embed + chat)
-├── ingest.py        File parsing, chunking, embedding, ChromaDB storage
+├── config.py        All tunable constants + air-gap env kill-switches
+├── llm.py           Async Ollama wrappers (embed + chat), trust_env=False
+├── store.py         Qdrant/Haystack document store — the only DB seam
+├── ingest.py        File parsing, chunking, embedding, storage
 ├── retriever.py     Hybrid RAG pipeline (semantic + BM25 + RRF)
-├── bm25_index.py    In-memory BM25 index, rebuilt after every write
+├── bm25_index.py    Incremental BM25 index, persisted between restarts
+├── migrate_to_qdrant.py  One-off ChromaDB → Qdrant migration
 ├── static/
 │   └── index.html   Single-file frontend (vanilla JS, no build step)
 ├── tests/
@@ -160,15 +167,19 @@ geo-assist/
 
 ## RAG pipeline
 
-**Ingestion:** file → text extraction (per page/slide, with headings detected and prepended) → recursive character chunking (512 chars, 80 overlap) → table detection (`Table N` regions tagged with `table_id` in metadata; applies to PDF and DOCX) → summary chunk synthesised (KV-pattern regex → LLM fallback for manuals/reports) → batch embed with `search_document:` prefix → store in ChromaDB with `{doc_id, filename, page, folder, chunk_type, [table_id]}` metadata. `doc_id = sha256(bytes)[:16]`; re-ingesting the same file is idempotent. Up to 16 files prepared concurrently (semaphore-bounded to cap RAM).
+**Ingestion:** file → **parse in a worker process** (text extraction per page/slide with headings prepended, recursive character chunking, table detection, image extraction) → summary chunk synthesised (KV-pattern regex → LLM fallback) → document number + revision extracted once by the LLM → batch embed with `search_document:` prefix → store with `{doc_id, filename, page, chunk_index, folder, doc_number, revision, chunk_type, [table_id]}` metadata. `doc_id = sha256(bytes)[:16]`; re-ingesting the same file is idempotent.
 
-**Images (optional):** extracted from PDF/PPTX/DOCX → OCR if `GEO_OCR=true` (easyocr, sub-second; results with fewer than `OCR_MIN_WORDS` words are dropped). Stored as `chunk_type=image` chunks with `chunk_index < -100`. Run as background task — does not block text ingest.
+Parsing runs in a `ProcessPoolExecutor` (`PREPARE_CONCURRENCY`, default `min(8, cpu_count)`). It used to run inline in an async function, which meant the old `_PREPARE_CONCURRENCY = 16` bought no parallelism at all — every file was parsed sequentially on the event loop, stalling `/ingest/status` polls and any in-flight query.
+
+Bulk ingest flushes to the store every `_WRITE_FLUSH_EVERY` (25) files instead of gathering every payload first, and uses per-file error isolation: one corrupt PDF among hundreds is recorded in `job.errors` and the rest of the batch still lands. Previously it raised out of `asyncio.gather` and discarded the whole job's work.
+
+**Images (optional):** extracted from PDF/PPTX/DOCX in the parse worker, downscaled, and **written to `./data/images/{doc_id}/`**. OCR runs if `GEO_OCR=true` (easyocr, sub-second). Images whose OCR is too sparse (diagrams, schematics) are **no longer dropped** — they are stored with `caption_status="pending"` so a vision pass can caption them later by filter, without re-parsing the source. Retrieval runs over the text caption only: joint image/text embedding models are strongly biased toward text and retrieve images poorly. Stored as `chunk_type=image` chunks with `chunk_index < -100`, written by a background task that does not block text ingest.
 
 **Query:**
 1. Last user turn from session history prepended to retrieval query (context-aware retrieval for follow-ups)
-2. LLM generates 2 query variants (multi-query expansion)
-3. All 3 queries embedded with `search_query:` prefix, searched concurrently
-4. BM25 keyword search — value queries (pressure, voltage, diameter, etc.) get 2× candidate pool
+2. Multi-query expansion — **off by default** (`QUERY_EXPANSION=false`); it costs a full LLM round-trip (~20-25s on CPU) before retrieval even starts. When enabled the LLM generates up to 3 variants
+3. Query (plus any variants) embedded with `search_query:` prefix, searched concurrently
+4. BM25 keyword search — value queries (pressure, voltage, diameter, etc.) get 2× candidate pool. Top-k is taken with a heap, not by sorting the full corpus
 5. Semantic hits + BM25 hits merged via Reciprocal Rank Fusion (RRF, k=60); value queries get 2× BM25 weight
 6. Named-doc injection, system-name injection, summary boost, table-chunk boost (1.5× for value queries)
 7. Cross-encoder reranking — scores top 20 (query, chunk) pairs; falls back to RRF order if not installed
@@ -191,13 +202,19 @@ geo-assist/
 | `CHAT_MODEL` | `qwen3.5:4b` | Ollama chat model; requires `"think": false` on every call (see `llm.py`) |
 | `EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model |
 | `CHUNK_SIZE` | 512 | Characters per chunk (~128 tokens) |
-| `CHUNK_OVERLAP` | 80 | Character overlap between chunks |
+| `CHUNK_OVERLAP` | 128 | Character overlap between chunks |
 | `RETRIEVAL_K` | 15 | Candidates fetched per query before RRF — do not raise above ~20; value queries double this automatically |
-| `DISTANCE_THRESHOLD` | 1.3 | Cosine distance cutoff for semantic gate |
-| `RERANK_ENABLED` | `true` | Cross-encoder reranking; requires `pip install -r requirements-reranker.txt` (falls back gracefully if not installed) |
+| `DISTANCE_THRESHOLD` | 1.3 | Cosine distance cutoff for semantic gate (distance = `1 - qdrant_similarity`) |
+| `QUERY_EXPANSION` | `false` | Multi-query expansion; adds a full LLM round-trip before retrieval |
+| `RERANK_ENABLED` | `true` | Cross-encoder reranking; requires `pip install -r requirements-reranker.txt` (falls back gracefully if not installed). Runs in a thread — never call it inline on the event loop |
 | `RERANK_TOP_N` | 20 | Candidates scored by the cross-encoder |
 | `OCR_ENABLED` | `false` | easyocr fast-path for image text extraction; requires `pip install -r requirements-ocr.txt` |
-| `OCR_MIN_WORDS` | 10 | Minimum word count from OCR to accept the result (below this the image is dropped) |
+| `OCR_MIN_WORDS` | 10 | Minimum word count from OCR to accept it as a caption |
+| `KEEP_UNCAPTIONED_IMAGES` | `true` | Persist images whose OCR was too sparse, flagged `caption_status="pending"` for a later vision pass |
+| `CHAT_CONCURRENCY` | 1 | Bound on concurrent **non-interactive** LLM generations. `chat_stream` (the interactive answer path) is deliberately ungated so a user question is never queued behind a bulk ingest |
+| `PREPARE_CONCURRENCY` | `min(8, cpu_count)` | Files parsed concurrently in the process pool |
+| `QDRANT_HOST` / `QDRANT_PORT` | `127.0.0.1` / 6333 | Local Qdrant server |
+| `EMBED_DIM` | 768 | Must match the embedding model; changing it requires a re-index |
 
 ## Bulk ingest / reindex scripts
 
@@ -208,7 +225,27 @@ python3 reindex.py --dir ~/my-docs --folder "Project Alpha"
 python3 resume_reindex.py --dir ~/my-docs --folder "Project Alpha"
 ```
 
-Both scripts defer BM25 rebuild to a single call at the end (not after every batch) — do not change this; O(n×batches) rebuilds would make large ingests take hours.
+Both scripts defer `bm25_index.commit()` to a single call at the end (not after every batch) — do not change this.
+
+**BM25 is now incremental.** `bm25_index` keeps the tokenised corpus in memory and persists it alongside the index, so adding or deleting a document only tokenises the chunks that changed. `add()` / `remove_doc()` mark the index dirty; `commit()` re-fits and saves. The old `rebuild(col)` re-read the entire corpus from the database and re-ran the Snowball stemmer over every chunk on *every single ingest and delete* — ingesting 500 files one at a time meant 500 full rebuilds. `rebuild_from_store()` still exists but is only the cold-start fallback; keep it off the hot path.
+
+## Benchmarking
+
+`benchmark_models.py` compares chat models on **latency and stability** — no labelled
+answers required. Retrieval runs once per question and the identical context is
+replayed to every model, so the numbers reflect the model, not retrieval jitter.
+
+```bash
+python3 benchmark_models.py --models qwen3.5:4b llama3.1:8b --runs 3
+python3 benchmark_models.py --questions my_questions.txt --out results.md
+```
+
+The column that matters is **numeric drift**: every number+unit in each answer is
+extracted and compared across repeat runs of the same question. A model that
+answers "28 V" once and "24 V" the next time is unusable for spec lookups no
+matter how fast it is — which is exactly how `llama3.1:8b` and `llama3.2` were
+disqualified. Treat near-zero drift as the entry requirement and speed as the
+tiebreak, not the other way round.
 
 ## Linting
 
@@ -224,9 +261,39 @@ ruff check --fix .
 - ChromaDB prints `"capture() takes 1 positional argument"` telemetry warnings — harmless.
 - `asyncio.iscoroutinefunction` deprecation warnings from FastAPI/Starlette on Python 3.14 — third-party issue, not ours.
 
+## Qdrant
+
+Qdrant runs as a **server process**, started by the platform start script and bound to `127.0.0.1`. The binary is not committed (~30 MB) — download `qdrant-x86_64-pc-windows-msvc.zip` (or the matching platform build) from https://github.com/qdrant/qdrant/releases and unpack it to `./qdrant/`. On an air-gapped machine, copy it across alongside the release zip.
+
+**Embedded mode is deliberately not used.** `QdrantDocumentStore(path=...)` runs in the client's local mode, which is brute-force only (no HNSW), documented as suitable for under ~20k points, and raises `RuntimeError` on concurrent access to the same path. The production corpus is well past that ceiling (34,809 chunks across 16 documents when last measured; earlier notes claimed 148k, which the database did not bear out). The **test suite does** use local mode — a handful of documents per test, no server needed, same client API.
+
+Chunk IDs keep the `{doc_id}_{page}_{chunk_index}` scheme. Qdrant only accepts UUID/int point IDs, but the Haystack integration maps each string ID through a deterministic uuid5 and keeps the original in the payload, so ID-derived logic (`endswith("_1_-1")`, neighbour reconstruction) is unaffected.
+
+Qdrant returns cosine **similarity**; Chroma returned cosine **distance**. `store.py` converts via `1.0 - score` so `DISTANCE_THRESHOLD` and the injection sentinels (991.0–999.0) keep their meaning. Don't remove that conversion without auditing every comparison in `retriever.py`.
+
+### Migrating an existing ChromaDB
+
+```bash
+pip install "chromadb>=0.6,<1.0"        # only needed for the migration
+python3 migrate_to_qdrant.py --dry-run  # check what would happen
+python3 migrate_to_qdrant.py            # reuses stored vectors, no re-embedding
+python3 migrate_to_qdrant.py --verify-only
+```
+
+Stored embeddings are copied as-is, so a 148k-chunk corpus migrates in minutes rather than the hours a re-ingest would take. `doc_number`/`revision` are new fields and stay `—` until you run `--backfill-catalog` (one LLM call per document) or re-ingest. Figures are not backfillable — the old pipeline discarded image bytes; re-ingest a file to persist its figures. The legacy database is only read, never modified.
+
+## Air-gap enforcement
+
+Requirement 3 ("no data leaves the machine") is enforced in code and pinned by `tests/test_airgap.py`, not left to deployment discipline:
+
+- `config.py` sets `HAYSTACK_TELEMETRY_ENABLED=False` (Haystack telemetry is **on by default** and posts to a deepset endpoint), plus `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE`.
+- `store.py` re-sets the telemetry flag in a bare statement *between* its two import blocks, because an import sorter will move `import config` below third-party imports and silently re-enable it. It also replaces `_telemetry.send_event` with a no-op. Don't "tidy" either.
+- `llm.py` builds its httpx client with `trust_env=False`. Without it, `HTTP_PROXY`/`ALL_PROXY` in the environment would route every prompt and document excerpt bound for localhost Ollama through a corporate proxy.
+- Start scripts bind Qdrant to `127.0.0.1` explicitly and set `QDRANT__TELEMETRY_DISABLED=true`; the default bind is `0.0.0.0`, which would expose the whole corpus to the local network.
+
 ## Known issues
 
-- **ChromaDB 1.x Rust backend hangs on large databases.** `chromadb>=1.0` uses a Rust-based connection pool. On a production database ≥ 700 MB (e.g. 148k chunks), `col.count()` blocks indefinitely with `pool timed out while waiting for an open connection`. Tests pass because they use empty `tmp_path` databases. If you hit this on Windows, downgrade: `pip install "chromadb>=0.6,<1.0"` to use the Python backend.
+- ~~**ChromaDB 1.x Rust backend hangs on large databases.**~~ — resolved by the move to Qdrant. ChromaDB is no longer a runtime dependency; it is only installed temporarily to run `migrate_to_qdrant.py`.
 
 
 ## Frontend design system
@@ -257,6 +324,9 @@ The `#send-btn` is `position: absolute` inside `#input-wrap` — do not add `dis
 - ~~Folder drag-drop in UI~~ — implemented. Dropping a folder auto-fills the folder name field and recursively collects all files via `webkitGetAsEntry()` (handles the 100-item `readEntries` pagination limit).
 - ~~Comparison/information tables~~ — implemented. LLM formats comparison queries as markdown tables.
 - ~~Table-aware extraction (Phase 2)~~ — implemented. `_extract_pdf` uses `page.find_tables()` (PyMuPDF ≥1.25) and renders tables as markdown in reading order (y0-sorted interleaving of text blocks and table markdown). Documents uploaded before this was added need re-ingestion to benefit.
+- ~~Query-time revision extraction regex~~ — replaced. `doc_number` and `revision` are extracted once at ingest by an LLM call and stored in metadata; catalog queries are now a metadata read. This deleted ~280 lines of regex tuned to one customer's "Is. 3 - Rev. 2" / "E3R10" / French "Éd./Rév." conventions, which ran on every catalog query for every document and silently produced an em dash for any convention it had not been taught.
+- ~~Named-doc matching hijacking the context window~~ — fixed. Matching is word-bounded with a 6-character stem minimum. Under the old bare-substring, 4-character rule a file called `data.pdf` matched any question containing "data" — and a matched document is granted *every* context slot by `_diverse_top`.
+- **Vision captioning for figures** — not yet wired. Images are now persisted at ingest and flagged `caption_status="pending"`, so this can be added without re-ingesting. Approach (per the Haystack multimodal tutorial): caption with a local Ollama VLM at index time for retrieval, and pass the original image to a vision model at answer time. Model choice is unbenchmarked — candidates should be measured on real figures for caption quality and per-image CPU latency before committing.
 - ~~Re-ranking with a cross-encoder after RRF~~ — implemented. Optional; enable with `GEO_RERANK=true`. Requires `pip install -r requirements-reranker.txt` and pre-downloading the model (needs internet once). See `reranker.py` and `config.py`.
 - ~~Delete all / clear collection endpoint~~ — implemented. `DELETE /documents`. "Clear all" button in sidebar UI.
 - ~~Procedure agent mode~~ — implemented. Each doc has a ▶ button (hover to reveal) that starts procedure mode. LLM synthesizes steps from the document content (works on specs, manuals, and descriptions — not just docs with explicit numbered lists). Current step is injected into the system prompt; model is instructed to flag conflicts against retrieved reference docs with `⚠️ CONFLICT:` warnings. See `retriever._generate_procedure_steps()`, `retriever._PROCEDURE_SYSTEM`, `retriever._build_system()`, and the `/procedure/session/*` endpoints in `main.py`.
@@ -273,4 +343,21 @@ Step-by-step procedure walkthrough is implemented within the main agent (no sepa
 - `/procedure/session/{id}/start`, `/navigate`, `DELETE` in `main.py`; state stored in `_proc_sessions`
 - `#proc-bar` in `static/index.html`; JS state in `_procState`
 
-**Do not** set `keep_alive: -1` unconditionally if targeting machines where RAM is tight. The current value keeps models loaded permanently; consider `keep_alive: 300` (5-minute idle unload) as an alternative.
+## Model residency
+
+`config.KEEP_ALIVE` (env `GEO_KEEP_ALIVE`, default `"5m"`) controls how long Ollama
+keeps a model in RAM after its last use. It is passed on every Ollama call in
+`llm.py`.
+
+This was previously hard-coded to `-1` — never unload — at all three call sites, to
+dodge the ~30s cold load on first query. On a 16 GB machine that is too aggressive:
+the chat model and the embedding model each pin themselves permanently, and any
+second model (a benchmark sweep, or changing `GEO_CHAT_MODEL`) stacks on top rather
+than replacing, until the machine swaps.
+
+`"5m"` keeps an active session warm and lets an idle machine reclaim the memory.
+Set `GEO_KEEP_ALIVE=-1` to restore always-resident behaviour where RAM allows, or
+`0` to unload after every call.
+
+`llm.unload(model)` evicts a model immediately; `benchmark_models.py` calls it
+between models so a sweep does not accumulate all of them.

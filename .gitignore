@@ -14,8 +14,12 @@ build/
 venv/
 env/
 
-# Data — ChromaDB and BM25 index are machine-local, not committed
+# Data — Qdrant storage, BM25 index, originals and extracted figures are
+# machine-local, not committed
 data/
+
+# Qdrant server binary (~30 MB) — downloaded per platform, see CLAUDE.md
+qdrant/
 
 # Secrets / auth state (also covered by data/ above)
 data/users.json
@@ -50,3 +54,7 @@ htmlcov/
 
 # Eval output
 geo-assist-eval/
+data/to_ingest/
+
+# Runtime marker written by the start scripts
+.qdrant-initialized

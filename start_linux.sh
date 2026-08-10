@@ -119,6 +119,60 @@ confirm_model "$CHAT_MODEL" "Chat"
 confirm_model "nomic-embed-text" "Embed"
 echo ""
 
+# -- start Qdrant -------------------------------------------------------------------
+# Qdrant runs as a local server process bound to loopback. Embedded mode is not
+# used: it is brute-force only and documented as suitable for under ~20k points,
+# where the production corpus is ~148k chunks.
+#
+# The binary is expected at ./qdrant/qdrant. It is not committed to the repo
+# (~30 MB); download it once from https://github.com/qdrant/qdrant/releases for
+# your platform and unpack it there. On an air-gapped machine, copy it across
+# alongside the release archive.
+QDRANT_PORT="${GEO_QDRANT_PORT:-6333}"
+QDRANT_BIN="$(dirname "$0")/qdrant/qdrant"
+QDRANT_STORAGE="$(dirname "$0")/data/qdrant"
+QDRANT_PID=""
+
+qdrant_up() {
+    curl -s -o /dev/null -m 2 "http://127.0.0.1:${QDRANT_PORT}/readyz"
+}
+
+echo "Checking Qdrant..."
+if qdrant_up; then
+    echo "  [OK] Qdrant already running on port ${QDRANT_PORT}"
+elif [ ! -x "$QDRANT_BIN" ]; then
+    echo "  [!!] qdrant binary not found at $QDRANT_BIN"
+    echo "       Download it from https://github.com/qdrant/qdrant/releases"
+    echo "       and unpack it to ./qdrant/ (chmod +x qdrant/qdrant)"
+    exit 1
+else
+    mkdir -p "$QDRANT_STORAGE"
+    # Bind to loopback explicitly — the default 0.0.0.0 would expose the whole
+    # document corpus to anything on the local network.
+    QDRANT__SERVICE__HOST=127.0.0.1 \
+    QDRANT__SERVICE__HTTP_PORT="$QDRANT_PORT" \
+    QDRANT__STORAGE__STORAGE_PATH="$QDRANT_STORAGE" \
+    QDRANT__TELEMETRY_DISABLED=true \
+        "$QDRANT_BIN" >/dev/null 2>&1 &
+    QDRANT_PID=$!
+    echo -n "  Starting Qdrant on 127.0.0.1:${QDRANT_PORT}."
+    QDRANT_READY=false
+    for i in $(seq 1 30); do
+        sleep 0.5
+        if qdrant_up; then QDRANT_READY=true; break; fi
+        echo -n "."
+    done
+    echo ""
+    if [ "$QDRANT_READY" = true ]; then
+        echo "  [OK] Qdrant ready"
+    else
+        echo "  [!!] Qdrant did not become ready in 15s."
+        kill "$QDRANT_PID" 2>/dev/null
+        exit 1
+    fi
+fi
+echo ""
+
 # -- install python deps ---------------------------------------------------------------
 echo "Checking Python dependencies..."
 if ! python3 -m pip install -r requirements.txt -q; then
@@ -137,6 +191,12 @@ cleanup() {
     echo ""
     echo "Shutting down Geo-Assist..."
     kill "$SERVER_PID" 2>/dev/null
+    # Only stop Qdrant if this script started it — a pre-existing instance may
+    # be in use by something else.
+    if [ -n "$QDRANT_PID" ]; then
+        echo "Stopping Qdrant..."
+        kill "$QDRANT_PID" 2>/dev/null
+    fi
 }
 trap cleanup EXIT
 

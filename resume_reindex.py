@@ -2,9 +2,8 @@
 """
 Resume an interrupted reindex from where it left off.
 
-Connects to the existing ChromaDB (no wipe), finds which filenames are
-already indexed, and only ingests the missing ones. Defers BM25 rebuild
-to a single call at the end.
+Connects to the existing store (no wipe), finds which filenames are already
+indexed, and only ingests the missing ones.
 
 Usage:
     python3 resume_reindex.py
@@ -25,36 +24,26 @@ if not src_dir.is_dir():
     print(f"ERROR: {src_dir} is not a directory")
     sys.exit(1)
 
-import config  # noqa: E402
-import bm25_index as _bm25  # noqa: E402
-import ingest as _ingest  # noqa: E402
-import chromadb  # noqa: E402
-from chromadb.config import Settings  # noqa: E402
-
-client = chromadb.PersistentClient(
-    path=config.CHROMA_PATH,
-    settings=Settings(anonymized_telemetry=False),
-)
-col = client.get_or_create_collection("docs", metadata={"hnsw:space": "cosine"})
-
-# Find already-ingested filenames
-all_meta = col.get(include=["metadatas"])["metadatas"] or []
-already_done = {m["filename"] for m in all_meta}
-print(f"Already indexed: {len(already_done)} unique filenames ({col.count()} chunks)")
+import bm25_index as _bm25
+import ingest as _ingest
+import store
 
 ALLOWED = {".pdf", ".docx", ".pptx", ".txt", ".csv"}
 all_files = sorted([f for f in src_dir.iterdir() if f.suffix.lower() in ALLOWED])
-remaining = [f for f in all_files if f.name not in already_done]
-print(f"Remaining: {len(remaining)} files\n")
 
 BATCH = 10
-total_batches = (len(remaining) + BATCH - 1) // BATCH
 
-# Skip BM25 rebuilds during the loop — one rebuild at the end
-real_rebuild = _bm25.rebuild
-_bm25.rebuild = lambda col: None
 
 async def run():
+    # Document-level listing rather than a full metadata scan of every chunk.
+    docs = await store.doc_summaries()
+    already_done = {d["filename"] for d in docs}
+    print(f"Already indexed: {len(already_done)} unique filenames ({await store.count()} chunks)")
+
+    remaining = [f for f in all_files if f.name not in already_done]
+    total_batches = (len(remaining) + BATCH - 1) // BATCH
+    print(f"Remaining: {len(remaining)} files\n")
+
     total_chunks = 0
     for i in range(0, len(remaining), BATCH):
         batch = remaining[i : i + BATCH]
@@ -67,10 +56,9 @@ async def run():
             print(f"  [{status}] {r['filename']}  ({chunks} chunks)")
         print(f"  — batch {i//BATCH + 1}/{total_batches} done, {total_chunks} new chunks so far")
 
-    _bm25.rebuild = real_rebuild
-    total_in_index = col.count()
-    print(f"\nBuilding BM25 index over all {total_in_index} chunks…")
-    real_rebuild(col)
+    _bm25.commit()
+    total_in_index = await store.count()
     print(f"\nDone. {total_chunks} new chunks added. Total in index: {total_in_index}")
+    await store.aclose()
 
 asyncio.run(run())
