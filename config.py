@@ -14,7 +14,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
-OLLAMA_BASE = "http://127.0.0.1:11434"
+OLLAMA_BASE = os.environ.get("GEO_OLLAMA_BASE", "http://127.0.0.1:11434")
 CHAT_MODEL   = os.environ.get("GEO_CHAT_MODEL",   "qwen3.5:4b")
 # qwen3.5:4b outperformed both llama3.2:latest (3B, hallucinated wrong values) and
 # llama3.1:8b (8B, self-contradicted with multiple wrong values in one answer) on
