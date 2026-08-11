@@ -152,12 +152,6 @@ python3 reindex.py --dir ~/Desktop/my-docs
 python3 reindex.py --dir ~/Desktop/my-docs --limit 50   # first 50 files only
 ```
 
-Resume an interrupted re-index without wiping:
-
-```bash
-python3 resume_reindex.py --dir ~/Desktop/my-docs
-```
-
 ## Ingesting from a NAS share
 
 Mount the share read-only into the container and point `GEO_NAS_ROOT` at it — see

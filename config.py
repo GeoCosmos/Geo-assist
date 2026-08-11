@@ -67,7 +67,6 @@ OCR_IMAGE_MAX_SIDE    = 1024    # resize to this before OCR
 OCR_IMAGE_JPEG_QUALITY = 82     # JPEG quality after downscale (strips EXIF implicitly)
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-CHROMA_PATH = os.path.join(DATA_DIR, "chroma_db")  # legacy — read-only, used by migrate_to_qdrant.py
 BM25_PATH = os.path.join(DATA_DIR, "bm25_index.pkl")
 
 # ── Qdrant ────────────────────────────────────────────────────────────────────
@@ -110,6 +109,7 @@ IMAGES_DIR = os.path.join(DATA_DIR, "images")
 # persisted and flagged caption_status="pending" so a vision pass can caption it
 # without re-parsing the source document.
 KEEP_UNCAPTIONED_IMAGES = os.environ.get("GEO_KEEP_IMAGES", "true").lower() == "true"
+
 # ── NAS ingestion ─────────────────────────────────────────────────────────────
 # Root of the mounted document share, as seen *inside* this container. The host
 # CIFS mount is bind-mounted here read-only (see deploy/docker-compose.yml), so

@@ -127,7 +127,7 @@ GEO_CHAT_MODEL=qwen3.5:4b python3 -m uvicorn main:app --host 127.0.0.1 --port 87
 
 Pushing a tag matching `v*` (e.g. `git tag v1.1.0 && git push origin v1.1.0`) triggers `.github/workflows/release.yml`, which zips the repo three times via `git archive` and publishes them to a GitHub Release. Each zip is trimmed to runtime-only files via `git archive` pathspec excludes (`:(exclude)path`):
 
-- `COMMON_EXCLUDES` drops dev-only paths from all three zips — `tests/`, `docs/`, `.github/`, `CLAUDE.md`, `pytest.ini`, `.gitignore`, `migrate_to_qdrant.py` (a one-off migration script, not part of the app), and `handoff.md` (internal notes — gitignored, but excluded explicitly so it cannot ship if ever committed).
+- `COMMON_EXCLUDES` drops dev-only paths from all three zips — `tests/`, `docs/`, `.github/`, `CLAUDE.md`, `pytest.ini`, `.gitignore`, and `handoff.md` (internal notes — gitignored, but excluded explicitly so it cannot ship if ever committed).
 - The Qdrant binary is **not** in the repo or the zips. Ship `qdrant/qdrant[.exe]` alongside the release archive, or have the target machine download it once.
 - Per-OS excludes drop the other OSes' start scripts — `geo-assist-windows-*.zip` ships only `start.bat`/`start.ps1`, `geo-assist-macos-*.zip` only `start_mac.sh`, `geo-assist-linux-*.zip` only `start_linux.sh`.
 
@@ -174,7 +174,6 @@ geo-assist/
 ├── nas.py           NAS share walker — junk exclusion, path containment
 ├── nas_manifest.py  SQLite record of which NAS files have been ingested
 ├── ingest_nas.py    NAS scan driver (walk → manifest diff → batch ingest)
-├── migrate_to_qdrant.py  One-off ChromaDB → Qdrant migration
 ├── deploy/
 │   └── docker-compose.yml  Reference copy of the VM deployment
 ├── static/
@@ -246,16 +245,15 @@ Bulk ingest flushes to the store every `_WRITE_FLUSH_EVERY` (25) files instead o
 
 ## Bulk ingest / reindex scripts
 
-`reindex.py` and `resume_reindex.py` both accept `--folder <name>` to assign all ingested documents to a named folder (default: `"General"`):
+`reindex.py` accepts `--folder <name>` to assign all ingested documents to a named folder (default: `"General"`):
 
 ```bash
 python3 reindex.py --dir ~/my-docs --folder "Project Alpha"
-python3 resume_reindex.py --dir ~/my-docs --folder "Project Alpha"
 ```
 
-Both scripts defer `bm25_index.commit()` to a single call at the end (not after every batch) — do not change this.
+It defers `bm25_index.commit()` to a single call at the end (not after every batch) — do not change this.
 
-**Both are only safe with the server stopped.** BM25 is in-memory state persisted
+**It is only safe with the server stopped.** BM25 is in-memory state persisted
 to a pickle by atomic replace. A second process that loads the pickle, adds to it,
 and writes it back while the server holds a stale in-memory copy loses whichever
 write lands first. This is why NAS ingestion is a route rather than a script — see
@@ -332,17 +330,6 @@ Chunk IDs keep the `{doc_id}_{page}_{chunk_index}` scheme. Qdrant only accepts U
 
 Qdrant returns cosine **similarity**; Chroma returned cosine **distance**. `store.py` converts via `1.0 - score` so `DISTANCE_THRESHOLD` and the injection sentinels (991.0–999.0) keep their meaning. Don't remove that conversion without auditing every comparison in `retriever.py`.
 
-### Migrating an existing ChromaDB
-
-```bash
-pip install "chromadb>=0.6,<1.0"        # only needed for the migration
-python3 migrate_to_qdrant.py --dry-run  # check what would happen
-python3 migrate_to_qdrant.py            # reuses stored vectors, no re-embedding
-python3 migrate_to_qdrant.py --verify-only
-```
-
-Stored embeddings are copied as-is, so a 148k-chunk corpus migrates in minutes rather than the hours a re-ingest would take. `doc_number`/`revision` are new fields and stay `—` until you run `--backfill-catalog` (one LLM call per document) or re-ingest. Figures are not backfillable — the old pipeline discarded image bytes; re-ingest a file to persist its figures. The legacy database is only read, never modified.
-
 ## Air-gap enforcement
 
 Requirement 3 ("no data leaves the machine") is enforced in code and pinned by `tests/test_airgap.py`, not left to deployment discipline:
@@ -354,7 +341,7 @@ Requirement 3 ("no data leaves the machine") is enforced in code and pinned by `
 
 ## Known issues
 
-- ~~**ChromaDB 1.x Rust backend hangs on large databases.**~~ — resolved by the move to Qdrant. ChromaDB is no longer a runtime dependency; it is only installed temporarily to run `migrate_to_qdrant.py`.
+- ~~**ChromaDB 1.x Rust backend hangs on large databases.**~~ — resolved by the move to Qdrant. ChromaDB is gone entirely: no longer a dependency, and the one-off migration script was removed once the migration completed.
 
 
 ## Frontend design system
