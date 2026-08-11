@@ -369,3 +369,28 @@ def test_nas_scan_returns_job_id(nas_api_tree, mock_ollama):
 def test_nas_scan_rejects_escape(nas_api_tree):
     r = client.post("/ingest/nas/scan", json={"subpath": "../../etc"})
     assert r.status_code == 403
+
+
+# ── source-file availability ──────────────────────────────────────────────────
+
+def test_file_route_reports_deployment_fault_when_directory_missing(tmp_path, monkeypatch):
+    """A missing originals directory is a storage-configuration problem, not a
+    property of the document — the old message asserted the wrong cause."""
+    monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path / "never-created"))
+    r = client.get("/documents/abc123def4567890/file")
+    assert r.status_code == 404
+    assert "not persisted" in r.json()["detail"]
+
+
+def test_file_route_reports_per_document_absence_when_directory_exists(tmp_path, monkeypatch):
+    originals = tmp_path / "originals"
+    originals.mkdir()
+    monkeypatch.setattr(config, "ORIGINALS_DIR", str(originals))
+    r = client.get("/documents/abc123def4567890/file")
+    assert r.status_code == 404
+    assert "No source file stored for this document" in r.json()["detail"]
+
+
+def test_file_route_still_rejects_a_malformed_doc_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path))
+    assert client.get("/documents/nothex/file").status_code == 404

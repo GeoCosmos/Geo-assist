@@ -1,4 +1,5 @@
 """Tests for document parsing and chunking."""
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -895,3 +896,29 @@ async def test_on_flush_receives_written_results(mock_ollama):
         for i in range(3)]
     await ingest._run_batch(items, on_flush=lambda batch: seen.extend(batch))
     assert sorted(r["key"] for r in seen) == ["k0", "k1", "k2"]
+
+
+# ── originals presence ────────────────────────────────────────────────────────
+
+def test_has_original_true_when_file_present(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path / "originals"))
+    os.makedirs(config.ORIGINALS_DIR)
+    open(os.path.join(config.ORIGINALS_DIR, "abc123def4567890.pdf"), "wb").write(b"x")
+    assert ingest.has_original("abc123def4567890") is True
+
+
+def test_has_original_false_when_file_absent(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path / "originals"))
+    os.makedirs(config.ORIGINALS_DIR)
+    assert ingest.has_original("abc123def4567890") is False
+
+
+def test_has_original_false_when_directory_missing(tmp_path, monkeypatch):
+    """The deployment case: data/ was never persisted, so nothing exists."""
+    monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path / "gone"))
+    assert ingest.has_original("abc123def4567890") is False
+
+
+def test_figure_index_inverts_the_chunk_index_encoding():
+    for idx in (0, 1, 7):
+        assert ingest.figure_index(ingest._IMAGE_CHUNK_IDX_BASE - idx) == idx

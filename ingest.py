@@ -1103,6 +1103,26 @@ async def move_document(doc_id: str, new_folder: str) -> int:
     return moved
 
 
+def has_original(doc_id: str) -> bool:
+    """Whether this document's source file is on disk.
+
+    Used to decide whether a citation should be rendered as a link. Without it
+    the UI offers every citation as a link and the only way to find a dead one is
+    to click it and get raw JSON in a new tab.
+    """
+    return bool(glob.glob(os.path.join(config.ORIGINALS_DIR, f"{doc_id}.*")))
+
+
+def figure_index(chunk_index: int) -> int:
+    """Recover an image's per-page index from its stored chunk_index.
+
+    Inverts the encoding in `_analyze_and_store_images`, which writes
+    `_IMAGE_CHUNK_IDX_BASE - img_idx` so image chunks never collide with text
+    chunks (>= 0) or the summary chunk (-1).
+    """
+    return _IMAGE_CHUNK_IDX_BASE - chunk_index
+
+
 def _remove_files(doc_id: str) -> None:
     for path in glob.glob(os.path.join(config.ORIGINALS_DIR, f"{doc_id}.*")):
         os.remove(path)

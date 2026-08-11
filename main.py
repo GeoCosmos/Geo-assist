@@ -244,9 +244,24 @@ _DOC_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 async def get_document_file(doc_id: str):
     if not _DOC_ID_RE.match(doc_id):
         raise HTTPException(404, "Document not found")
+    # Distinguish a storage-configuration fault from a per-document one. The
+    # previous single message asserted "ingested before this feature was added"
+    # even when the entire originals directory was missing — which is what
+    # happens when the data directory is not persisted, and says nothing about
+    # the document.
+    if not os.path.isdir(config.ORIGINALS_DIR):
+        raise HTTPException(
+            404,
+            "Source files are not available on this server — the data directory "
+            "is not persisted.",
+        )
     matches = glob.glob(os.path.join(config.ORIGINALS_DIR, f"{doc_id}.*"))
     if not matches:
-        raise HTTPException(404, "Original file not available (ingested before this feature was added)")
+        raise HTTPException(
+            404,
+            "No source file stored for this document. It was ingested before "
+            "source files were kept, or the file was removed.",
+        )
     return FileResponse(matches[0], headers={"Content-Disposition": "inline"})
 
 
