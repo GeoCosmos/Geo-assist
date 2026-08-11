@@ -1,4 +1,5 @@
 """Tests for document parsing and chunking."""
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -533,7 +534,7 @@ async def test_tracked_job_records_per_file_errors(mock_ollama, monkeypatch):
     """
     import jobs
 
-    async def boom(data, fn, folder="General"):
+    async def boom(data, fn, folder="General", skip_doc_ids=None):
         raise RuntimeError("embed failure")
 
     monkeypatch.setattr(ingest, "_prepare", boom)
@@ -548,7 +549,7 @@ async def test_tracked_job_partial_failure_keeps_good_files(mock_ollama, monkeyp
     import jobs
     real_prepare = ingest._prepare
 
-    async def flaky(data, fn, folder="General"):
+    async def flaky(data, fn, folder="General", skip_doc_ids=None):
         if fn == "bad.txt":
             raise RuntimeError("unreadable")
         return await real_prepare(data, fn, folder=folder)
@@ -772,3 +773,153 @@ def test_extract_images_allowed_when_ocr_enabled(monkeypatch):
     monkeypatch.setattr(ingest, "_extract_images_pdf", lambda d: called.append(1) or [])
     ingest.extract_images(b"fake", "scan.pdf")
     assert called
+
+
+# ── batch runner: lazy loaders, correlation keys, fatal exceptions ─────────────
+
+@pytest.mark.asyncio
+async def test_run_batch_invokes_loaders_lazily(mock_ollama):
+    """Loaders must not all be called up front — that is the whole point of the
+    refactor. With a concurrency of 2, no more than 2 may be in flight at once."""
+    in_flight = 0
+    peak = 0
+
+    def make_loader(payload: bytes):
+        def load():
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            try:
+                return payload
+            finally:
+                in_flight -= 1
+        return load
+
+    items = [
+        ingest.BatchItem(make_loader(f"doc {i}".encode()), f"f{i}.txt", f"key{i}", "General")
+        for i in range(8)
+    ]
+    old = config.PREPARE_CONCURRENCY
+    config.PREPARE_CONCURRENCY = 2
+    try:
+        results, errors = await ingest._run_batch(items)
+    finally:
+        config.PREPARE_CONCURRENCY = old
+
+    assert errors == []
+    assert len(results) == 8
+    assert peak <= 2
+
+
+@pytest.mark.asyncio
+async def test_run_batch_echoes_correlation_key(mock_ollama):
+    items = [ingest.BatchItem(
+        ingest._bytes_loader(b"alpha content"), "a.txt", "Manuals/a.txt", "General")]
+    results, errors = await ingest._run_batch(items)
+    assert errors == []
+    assert results[0]["key"] == "Manuals/a.txt"
+
+
+@pytest.mark.asyncio
+async def test_run_batch_honours_per_item_folder(mock_ollama):
+    """One batch must span several folders — the NAS scan maps each subdirectory
+    onto its own folder and ingests them together."""
+    items = [
+        ingest.BatchItem(ingest._bytes_loader(b"alpha body"), "a.txt", "a", "Manuals"),
+        ingest.BatchItem(ingest._bytes_loader(b"beta body"), "b.txt", "b", "Avionics"),
+    ]
+    await ingest._run_batch(items)
+    docs = {d["filename"]: d["folder"] for d in await ingest.list_documents()}
+    assert docs["a.txt"] == "Manuals"
+    assert docs["b.txt"] == "Avionics"
+
+
+@pytest.mark.asyncio
+async def test_run_batch_reports_loader_failure_without_killing_batch(mock_ollama):
+    def boom():
+        raise OSError("stale file handle")
+
+    items = [
+        ingest.BatchItem(boom, "bad.txt", "bad", "General"),
+        ingest.BatchItem(ingest._bytes_loader(b"good content"), "good.txt", "good", "General"),
+    ]
+    results, errors = await ingest._run_batch(items)
+    assert len(errors) == 1
+    assert "bad.txt" in errors[0]
+    assert [r["key"] for r in results] == ["good"]
+
+
+@pytest.mark.asyncio
+async def test_fatal_exceptions_propagate_instead_of_becoming_per_file_errors(mock_ollama):
+    """Without this, a circuit breaker raised inside a loader is caught by the
+    per-file handler and the job reports success against a dead mount."""
+    class Unreachable(Exception):
+        pass
+
+    def boom():
+        raise Unreachable("mount gone")
+
+    items = [ingest.BatchItem(boom, "x.txt", "x", "General")]
+    with pytest.raises(Unreachable):
+        await ingest._run_batch(items, fatal_exceptions=(Unreachable,))
+
+
+@pytest.mark.asyncio
+async def test_ingest_many_still_accepts_bytes(mock_ollama):
+    """The upload path must be unaffected by the refactor."""
+    results = await ingest.ingest_many([(b"hello world", "h.txt")], folder="General")
+    assert results[0]["status"] == "ok"
+    assert results[0]["filename"] == "h.txt"
+
+
+@pytest.mark.asyncio
+async def test_skip_doc_ids_avoids_reingesting_known_content(mock_ollama):
+    first = await ingest.ingest(b"unique payload", "orig.txt", folder="Avionics")
+    doc_id = first["doc_id"]
+
+    items = [ingest.BatchItem(
+        ingest._bytes_loader(b"unique payload"), "orig.txt", "nas/orig.txt", "NasFolder")]
+    results, errors = await ingest._run_batch(items, skip_doc_ids={doc_id})
+    assert errors == []
+    assert results[0]["status"] == "skipped"
+
+    # The hand-filed folder must survive — this is the silent-reclassification bug.
+    docs = await ingest.list_documents()
+    assert next(d for d in docs if d["doc_id"] == doc_id)["folder"] == "Avionics"
+
+
+@pytest.mark.asyncio
+async def test_on_flush_receives_written_results(mock_ollama):
+    seen = []
+    items = [ingest.BatchItem(
+        ingest._bytes_loader(f"payload {i}".encode()), f"f{i}.txt", f"k{i}", "General")
+        for i in range(3)]
+    await ingest._run_batch(items, on_flush=lambda batch: seen.extend(batch))
+    assert sorted(r["key"] for r in seen) == ["k0", "k1", "k2"]
+
+
+# ── originals presence ────────────────────────────────────────────────────────
+
+def test_originals_index_lists_stored_doc_ids(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path / "originals"))
+    os.makedirs(config.ORIGINALS_DIR)
+    open(os.path.join(config.ORIGINALS_DIR, "abc123def4567890.pdf"), "wb").write(b"x")
+    open(os.path.join(config.ORIGINALS_DIR, "0011223344556677.docx"), "wb").write(b"x")
+    assert ingest.originals_index() == {"abc123def4567890", "0011223344556677"}
+
+
+def test_originals_index_empty_when_no_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path / "originals"))
+    os.makedirs(config.ORIGINALS_DIR)
+    assert ingest.originals_index() == set()
+
+
+def test_originals_index_empty_when_directory_missing(tmp_path, monkeypatch):
+    """The deployment case: data/ was never persisted, so nothing exists."""
+    monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path / "gone"))
+    assert ingest.originals_index() == set()
+
+
+def test_figure_index_inverts_the_chunk_index_encoding():
+    for idx in (0, 1, 7):
+        assert ingest.figure_index(ingest._IMAGE_CHUNK_IDX_BASE - idx) == idx

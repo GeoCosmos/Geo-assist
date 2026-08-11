@@ -1,9 +1,13 @@
 """Tests for FastAPI endpoints."""
 import json
+import os
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
+import config
+import ingest_nas
 import main
 
 client = TestClient(main.app)
@@ -294,3 +298,128 @@ def test_procedure_navigate_clamps_to_bounds(mock_ollama):
     r_next = client.post("/procedure/session/sess_clamp/navigate", json={"direction": "next"})
     assert r_next.status_code == 200
     assert r_next.json()["step_num"] == r_next.json()["total_steps"]
+
+
+# ── NAS ingestion endpoints ───────────────────────────────────────────────────
+
+@pytest.fixture
+def nas_api_tree(tmp_path, monkeypatch):
+    root = tmp_path / "documents"
+    (root / "Manuals").mkdir(parents=True)
+    (root / "Manuals" / "a.txt").write_bytes(b"alpha body")
+    (root / "b.txt").write_bytes(b"beta body")
+    monkeypatch.setattr(config, "NAS_ROOT", str(root))
+    monkeypatch.setattr(config, "NAS_MANIFEST_PATH", str(tmp_path / "m.db"))
+    # The manifest is a module-level singleton; drop it so it reopens against
+    # this test's monkeypatched path rather than a previous test's database.
+    ingest_nas._manifest_singleton = None
+    yield root
+    ingest_nas._manifest_singleton = None
+
+
+def test_nas_health_reports_available_root(nas_api_tree):
+    r = client.get("/ingest/nas/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["available"] is True
+    assert body["subfolders"] == ["Manuals"]
+
+
+def test_nas_health_reports_missing_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "NAS_ROOT", str(tmp_path / "absent"))
+    body = client.get("/ingest/nas/health").json()
+    assert body["available"] is False
+    assert body["reason"] == "missing"
+
+
+def test_nas_health_distinguishes_permission_denied(tmp_path, monkeypatch):
+    """EACCES and an empty share look identical without this — and a UID mismatch
+    between the container and the CIFS mount is the likeliest deploy failure."""
+    root = tmp_path / "locked"
+    root.mkdir()
+    monkeypatch.setattr(config, "NAS_ROOT", str(root))
+    monkeypatch.setattr(os, "access", lambda p, m: False)
+    body = client.get("/ingest/nas/health").json()
+    assert body["available"] is False
+    assert body["reason"] == "unreadable"
+
+
+def test_nas_preview_returns_counts(nas_api_tree, mock_ollama):
+    r = client.post("/ingest/nas/preview", json={"subpath": ""})
+    assert r.status_code == 200
+    assert r.json()["new"] == 2
+
+
+def test_nas_preview_rejects_escape(nas_api_tree):
+    r = client.post("/ingest/nas/preview", json={"subpath": "../.."})
+    assert r.status_code == 403
+
+
+def test_nas_preview_rejects_absolute_path(nas_api_tree):
+    r = client.post("/ingest/nas/preview", json={"subpath": "/etc"})
+    assert r.status_code == 403
+
+
+def test_nas_scan_returns_job_id(nas_api_tree, mock_ollama):
+    r = client.post("/ingest/nas/scan", json={"subpath": ""})
+    assert r.status_code == 200
+    assert "job_id" in r.json()
+
+
+def test_nas_scan_rejects_escape(nas_api_tree):
+    r = client.post("/ingest/nas/scan", json={"subpath": "../../etc"})
+    assert r.status_code == 403
+
+
+# ── source-file availability ──────────────────────────────────────────────────
+
+def test_file_route_reports_deployment_fault_when_directory_missing(tmp_path, monkeypatch):
+    """A missing originals directory is a storage-configuration problem, not a
+    property of the document — the old message asserted the wrong cause."""
+    monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path / "never-created"))
+    r = client.get("/documents/abc123def4567890/file")
+    assert r.status_code == 404
+    assert "not persisted" in r.json()["detail"]
+
+
+def test_file_route_reports_per_document_absence_when_directory_exists(tmp_path, monkeypatch):
+    originals = tmp_path / "originals"
+    originals.mkdir()
+    monkeypatch.setattr(config, "ORIGINALS_DIR", str(originals))
+    r = client.get("/documents/abc123def4567890/file")
+    assert r.status_code == 404
+    assert "No source file stored for this document" in r.json()["detail"]
+
+
+def test_file_route_still_rejects_a_malformed_doc_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path))
+    assert client.get("/documents/nothex/file").status_code == 404
+
+
+# ── figure serving ────────────────────────────────────────────────────────────
+
+def test_figure_route_serves_the_image(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "IMAGES_DIR", str(tmp_path / "images"))
+    doc_id = "a" * 16
+    os.makedirs(os.path.join(config.IMAGES_DIR, doc_id))
+    open(os.path.join(config.IMAGES_DIR, doc_id, "p3_i0.jpg"), "wb").write(b"\xff\xd8jpegbytes")
+
+    r = client.get(f"/documents/{doc_id}/figures/3/0")
+    assert r.status_code == 200
+    assert r.content == b"\xff\xd8jpegbytes"
+
+
+def test_figure_route_404s_for_missing_figure(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "IMAGES_DIR", str(tmp_path / "images"))
+    assert client.get(f"/documents/{'a' * 16}/figures/9/9").status_code == 404
+
+
+def test_figure_route_rejects_malformed_doc_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "IMAGES_DIR", str(tmp_path / "images"))
+    assert client.get("/documents/nothex/figures/1/0").status_code == 404
+
+
+def test_figure_route_rejects_non_integer_page(tmp_path, monkeypatch):
+    """FastAPI's int converter rejects these before any path is constructed."""
+    monkeypatch.setattr(config, "IMAGES_DIR", str(tmp_path / "images"))
+    assert client.get(f"/documents/{'a' * 16}/figures/notanint/0").status_code == 422

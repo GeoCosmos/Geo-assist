@@ -1,0 +1,75 @@
+# Reference copy of the VM deployment at /opt/geo-assist/docker-compose.yml.
+#
+# Kept in version control because the live file was previously tracked nowhere,
+# which meant the only record of how the app is actually deployed lived on one
+# machine. Apply changes on the VM, then mirror them here.
+#
+# The app image bakes in the source (`build: ./app`), so shipping code changes
+# is `docker compose build app && docker compose up -d app`, not a file copy.
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: geo-assist-ollama
+    restart: unless-stopped
+    volumes:
+      - ./ollama-models:/root/.ollama
+    networks:
+      - geo-assist-net
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: geo-assist-qdrant
+    restart: unless-stopped
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    networks:
+      - geo-assist-net
+
+  app:
+    build: ./app
+    container_name: geo-assist-app
+    restart: unless-stopped
+    depends_on:
+      - ollama
+      - qdrant
+    environment:
+      - GEO_CHAT_MODEL=qwen3:14b
+      - GEO_EMBED_MODEL=nomic-embed-text
+      - GEO_OLLAMA_BASE=http://ollama:11434
+      - GEO_QDRANT_HOST=qdrant
+      - GEO_QDRANT_PORT=6333
+      - GEO_NAS_ROOT=/app/documents
+    ports:
+      - "8743:8743"
+    volumes:
+      # config.DATA_DIR is /app/data. Without this bind it is ephemeral
+      # container filesystem, and every image rebuild destroys the BM25 index
+      # (rebuildable, but a full re-fit on each boot), data/originals (NOT
+      # recoverable — every citation's source link 404s afterwards), and
+      # data/images. The bind this replaced, ./data/uploads:/app/uploads,
+      # pointed at a path no code references and protected nothing.
+      - ./data:/app/data
+      # Document share, read-only. ./qnap-data is the CIFS mount holding the
+      # project folders. The underlying mount is rw, so :ro here is the only
+      # thing keeping the app off the NAS write path.
+      #
+      # This replaces the previous single-project bind
+      # (./qnap-data/<project>:/app/documents/<project>), which no code read —
+      # the whole share is exposed now and scoping happens in the UI instead.
+      #
+      # propagation: rslave — Docker bind mounts are point-in-time. Without it,
+      # a host CIFS remount (network blip, NAS reboot) leaves the container
+      # pointing at the stale mountpoint, and a scan then reports "0 new,
+      # everything unchanged" instead of failing.
+      - type: bind
+        source: ./qnap-data
+        target: /app/documents
+        read_only: true
+        bind:
+          propagation: rslave
+    networks:
+      - geo-assist-net
+
+networks:
+  geo-assist-net:
+    driver: bridge

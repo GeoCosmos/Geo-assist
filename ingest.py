@@ -6,7 +6,9 @@ import logging
 import os
 import re
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 import bm25_index
 import config
@@ -782,9 +784,23 @@ def _parse_worker(original_path: str, filename: str, doc_id: str) -> dict:
     }
 
 
-async def _prepare(data: bytes, filename: str, folder: str = "General") -> dict:
+async def _prepare(
+    data: bytes,
+    filename: str,
+    folder: str = "General",
+    skip_doc_ids: set[str] | None = None,
+) -> dict:
     """Parse, chunk, and embed one file. The slow part — safe to run concurrently."""
     doc_id = hashlib.sha256(data).hexdigest()[:16]
+
+    # doc_id is a content hash, so a file already ingested through the UI hashes
+    # identically when the same bytes turn up on the NAS. Without this guard
+    # _write would delete its chunks and rewrite them under the NAS-derived
+    # folder, silently reclassifying a document the user filed by hand. Checked
+    # before the original is written and before parsing, so a skip costs nothing.
+    if skip_doc_ids and doc_id in skip_doc_ids:
+        return {"doc_id": doc_id, "filename": filename, "status": "skipped"}
+
     loop = asyncio.get_running_loop()
 
     # Keep the original file so citations can link back to it. doc_id is a content
@@ -905,30 +921,77 @@ async def ingest(data: bytes, filename: str, folder: str = "General") -> dict:
 _WRITE_FLUSH_EVERY = 25
 
 
+Loader = Callable[[], bytes]
+
+
+@dataclass
+class BatchItem:
+    """One file's worth of work for _run_batch.
+
+    `folder` rides along per item rather than being a batch-wide argument, so a
+    single batch can span many NAS subdirectories that each map onto their own
+    document folder. `key` is opaque to this module and echoed back on the
+    result — the NAS scan uses it to carry the file's path relative to the share
+    root, which is the only stable identifier available: basenames collide across
+    directories, and doc_id is not known until the content has been read.
+    """
+    loader: Loader
+    filename: str
+    key: Any
+    folder: str = "General"
+
+
+def _bytes_loader(data: bytes) -> Loader:
+    """Wrap already-resident bytes as a loader, for the upload path."""
+    return lambda: data
+
+
 async def _run_batch(
-    files: list[tuple[bytes, str]],
-    folder: str,
+    items: list[BatchItem],
     on_prepared=None,
+    on_flush=None,
+    skip_doc_ids: set[str] | None = None,
+    fatal_exceptions: tuple = (),
 ) -> tuple[list[dict], list[str]]:
     """Prepare files concurrently and flush to the store in batches.
 
-    Returns (results, errors). A file that fails to parse is recorded as an error
-    and the rest of the batch still completes — previously a single corrupt PDF
-    among hundreds raised out of `asyncio.gather` and discarded every prepared
-    payload in the job.
+    The loader is called inside the concurrency semaphore rather than by the
+    caller, so at most PREPARE_CONCURRENCY file bodies are ever resident. This
+    function previously took `bytes` and required the caller to have read
+    everything up front, which on a share of thousands of files means gigabytes
+    resident before any work begins.
+
+    Returns (results, errors). A file that fails to load or parse is recorded as
+    an error and the rest of the batch still completes — previously a single
+    corrupt PDF among hundreds raised out of `asyncio.gather` and discarded every
+    prepared payload in the job.
+
+    Exceptions listed in `fatal_exceptions` propagate instead. That escape hatch
+    exists because a caller's circuit breaker ("the mount has gone away") would
+    otherwise be caught by the per-file handler and recorded as one more failed
+    file, letting the job report success against a dead mount.
     """
     sem = asyncio.Semaphore(config.PREPARE_CONCURRENCY)
     results: list[dict] = []
     errors: list[str] = []
     pending: list[dict] = []
 
-    async def _bounded(data: bytes, fn: str) -> dict:
+    async def _bounded(item: BatchItem) -> dict:
         async with sem:
             try:
-                payload = await _prepare(data, fn, folder=folder)
+                # Blocking read — a NAS file is a network round trip, and doing
+                # it on the event loop stalls every concurrent chat request.
+                loop = asyncio.get_running_loop()
+                data = await loop.run_in_executor(None, item.loader)
+                payload = await _prepare(
+                    data, item.filename, folder=item.folder, skip_doc_ids=skip_doc_ids
+                )
+            except fatal_exceptions:
+                raise
             except Exception as exc:  # per-file isolation is the point
-                log.warning("ingest failed for %s", fn, exc_info=True)
-                payload = {"filename": fn, "status": "error", "error": str(exc)}
+                log.warning("ingest failed for %s", item.filename, exc_info=True)
+                payload = {"filename": item.filename, "status": "error", "error": str(exc)}
+            payload["key"] = item.key
             if on_prepared:
                 on_prepared()
             return payload
@@ -936,28 +999,52 @@ async def _run_batch(
     async def _flush() -> None:
         if not pending:
             return
+        written: list[dict] = []
         async with _lock:
             for payload in pending:
-                results.append(await _write(payload))
+                if payload["status"] == "skipped":
+                    written.append({
+                        "doc_id": payload["doc_id"], "filename": payload["filename"],
+                        "key": payload["key"], "chunks": 0, "status": "skipped",
+                    })
+                    continue
+                result = await _write(payload)
+                result["key"] = payload["key"]
+                written.append(result)
             bm25_index.commit()
+        results.extend(written)
+        if on_flush:
+            on_flush(written)
         pending.clear()
 
-    tasks = [asyncio.create_task(_bounded(data, fn)) for data, fn in files]
-    for coro in asyncio.as_completed(tasks):
-        payload = await coro
-        if payload.get("status") == "error":
-            errors.append(f"{payload['filename']}: {payload['error']}")
-            continue
-        pending.append(payload)
-        if len(pending) >= _WRITE_FLUSH_EVERY:
-            await _flush()
+    tasks = [asyncio.create_task(_bounded(item)) for item in items]
+    try:
+        for coro in asyncio.as_completed(tasks):
+            payload = await coro
+            if payload.get("status") == "error":
+                errors.append(f"{payload['filename']}: {payload['error']}")
+                continue
+            pending.append(payload)
+            if len(pending) >= _WRITE_FLUSH_EVERY:
+                await _flush()
+    except fatal_exceptions:
+        # Commit what already succeeded before surfacing the fatal condition, so
+        # an aborted scan resumes from where it stopped rather than from zero.
+        for task in tasks:
+            task.cancel()
+        # Await the cancellations before flushing, or the loop logs "Task was
+        # destroyed but it is pending" for each one as it is garbage collected.
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await _flush()
+        raise
     await _flush()
     return results, errors
 
 
 async def ingest_many(files: list[tuple[bytes, str]], folder: str = "General") -> list[dict]:
     """Ingest multiple files with concurrent parse+embed and batched writes."""
-    results, _errors = await _run_batch(files, folder)
+    items = [BatchItem(_bytes_loader(data), fn, fn, folder) for data, fn in files]
+    results, _errors = await _run_batch(items)
     return results
 
 
@@ -975,8 +1062,9 @@ async def ingest_many_tracked(files: list[tuple[bytes, str]], job, folder: str =
     def _tick() -> None:
         job.prepared += 1
 
+    items = [BatchItem(_bytes_loader(data), fn, fn, folder) for data, fn in files]
     try:
-        results, errors = await _run_batch(files, folder, on_prepared=_tick)
+        results, errors = await _run_batch(items, on_prepared=_tick)
         job.results = results
         job.errors.extend(errors)
         job.status = "done"
@@ -1013,6 +1101,35 @@ async def move_document(doc_id: str, new_folder: str) -> int:
     _invalidate_cache()
     bm25_index.update_folders({cid: new_folder for cid in chunk_ids})
     return moved
+
+
+def originals_index() -> set[str]:
+    """doc_ids whose source file is on disk, from a single directory read.
+
+    Used to decide whether a citation should be rendered as a link. Without it
+    the UI offers every citation as a link, and the only way to find a dead one
+    is to click it and get raw JSON in a new tab.
+
+    Deliberately a bulk read rather than a per-document glob. The catalog path
+    asks about every document in the corpus at once, and
+    `glob(ORIGINALS_DIR/{doc_id}.*)` rescans the whole directory per call — with
+    a few thousand NAS-ingested files that is O(docs x files) of synchronous
+    stat work on the event loop, mid-stream, stalling every concurrent chat.
+    """
+    try:
+        return {name.split(".", 1)[0] for name in os.listdir(config.ORIGINALS_DIR)}
+    except OSError:
+        return set()  # directory absent: no source files at all
+
+
+def figure_index(chunk_index: int) -> int:
+    """Recover an image's per-page index from its stored chunk_index.
+
+    Inverts the encoding in `_analyze_and_store_images`, which writes
+    `_IMAGE_CHUNK_IDX_BASE - img_idx` so image chunks never collide with text
+    chunks (>= 0) or the summary chunk (-1).
+    """
+    return _IMAGE_CHUNK_IDX_BASE - chunk_index
 
 
 def _remove_files(doc_id: str) -> None:

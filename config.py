@@ -67,7 +67,6 @@ OCR_IMAGE_MAX_SIDE    = 1024    # resize to this before OCR
 OCR_IMAGE_JPEG_QUALITY = 82     # JPEG quality after downscale (strips EXIF implicitly)
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-CHROMA_PATH = os.path.join(DATA_DIR, "chroma_db")  # legacy — read-only, used by migrate_to_qdrant.py
 BM25_PATH = os.path.join(DATA_DIR, "bm25_index.pkl")
 
 # ── Qdrant ────────────────────────────────────────────────────────────────────
@@ -110,6 +109,29 @@ IMAGES_DIR = os.path.join(DATA_DIR, "images")
 # persisted and flagged caption_status="pending" so a vision pass can caption it
 # without re-parsing the source document.
 KEEP_UNCAPTIONED_IMAGES = os.environ.get("GEO_KEEP_IMAGES", "true").lower() == "true"
+
+# ── NAS ingestion ─────────────────────────────────────────────────────────────
+# Root of the mounted document share, as seen *inside* this container. The host
+# CIFS mount is bind-mounted here read-only (see deploy/docker-compose.yml), so
+# the app has no write path to the NAS regardless of what the code does.
+#
+# Whether a NAS is actually present is deliberately not a constant here: an
+# os.path.isdir() evaluated at import time goes stale the moment the mount drops
+# or appears, and a container that started before the host mount was ready would
+# keep the feature disabled until someone restarted it. GET /ingest/nas/health
+# checks live on each call.
+NAS_ROOT = os.environ.get("GEO_NAS_ROOT", "/app/documents")
+NAS_MANIFEST_PATH = os.path.join(DATA_DIR, "nas_manifest.db")
+# Read failures during a scan before the job aborts with "NAS unreachable". The
+# CIFS mounts use `soft`, so a dropped mount surfaces as EIO on every read rather
+# than hanging — without this the job would grind through thousands of guaranteed
+# failures before reporting anything.
+NAS_IO_ERROR_LIMIT = int(os.environ.get("GEO_NAS_IO_ERROR_LIMIT", "10"))
+# Cap on entries in a job's error list. A share holding thousands of unsupported
+# files must not produce a status response with one line per file; the counts
+# still reflect the true totals.
+NAS_MAX_ERRORS = 200
+
 API_PORT = 8743
 
 # Cross-encoder re-ranking. Disabled by default — requires sentence-transformers and

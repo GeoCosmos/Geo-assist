@@ -76,7 +76,7 @@ async def _catalog_stream(question: str, folder_filter: str | None):
 
     yield {"token": "| File | Document No | Revision |\n| --- | --- | --- |\n"}
 
-    sources = []
+    source_acc = _source_acc()
     for doc in sorted(docs, key=lambda d: d["filename"].lower()):
         yield {
             "token": "| {} | {} | {} |\n".format(
@@ -85,11 +85,69 @@ async def _catalog_stream(question: str, folder_filter: str | None):
                 doc.get("revision") or "—",
             )
         }
-        sources.append({"filename": doc["filename"], "page": 1, "doc_id": doc["doc_id"]})
+        _add_source(source_acc, {"filename": doc["filename"], "page": 1, "doc_id": doc["doc_id"]})
 
-    yield {"sources": sources, "done": True}
+    yield {"sources": _finalize_sources(source_acc), "done": True}
 
 log = logging.getLogger(__name__)
+
+
+def _source_acc() -> dict:
+    """Accumulator for citation sources, keyed by doc_id.
+
+    One entry per document rather than per (doc_id, page). A document cited on
+    three pages previously produced three separate chips, and — more importantly
+    — a figure on a page that had also contributed a text chunk was dropped by
+    the old dedup, so it could never be displayed.
+
+    Python dicts preserve insertion order, so first-citation order (most
+    relevant document first) is retained for free.
+    """
+    return {}
+
+
+def _add_source(acc: dict, meta: dict) -> None:
+    """Record one retrieved chunk's provenance against its document."""
+    doc_id = meta["doc_id"]
+    entry = acc.get(doc_id)
+    if entry is None:
+        entry = {"filename": meta["filename"], "doc_id": doc_id, "pages": [], "figures": []}
+        acc[doc_id] = entry
+
+    page = meta.get("page", 1)
+    if page not in entry["pages"]:
+        entry["pages"].append(page)
+
+    if meta.get("chunk_type") == "image":
+        ref = {"page": page, "idx": ingest.figure_index(meta.get("chunk_index", 0))}
+        if ref not in entry["figures"]:
+            entry["figures"].append(ref)
+
+
+def _finalize_sources(acc: dict) -> list[dict]:
+    """Turn the accumulator into the payload sent to the client.
+
+    Reads the originals directory once for the whole answer. The catalog path
+    calls this with every document in the corpus, so a per-document glob would
+    be O(docs x files) of synchronous stat work on the event loop, mid-stream.
+    """
+    originals = ingest.originals_index()
+    out = []
+    for entry in acc.values():
+        pages = sorted(entry["pages"])
+        source = {
+            "filename": entry["filename"],
+            "doc_id": entry["doc_id"],
+            "pages": pages,
+            # Retained so anything reading the pre-grouping field keeps working,
+            # including conversations replayed from localStorage.
+            "page": pages[0] if pages else 1,
+            "has_original": entry["doc_id"] in originals,
+        }
+        if entry["figures"]:
+            source["figures"] = entry["figures"]
+        out.append(source)
+    return out
 
 _RRF_K = 60
 _EXPAND_WINDOW = 2  # neighbor chunks fetched on each side for parent-chunk retrieval
@@ -506,8 +564,7 @@ async def _catalog_context(
         by_doc.setdefault(meta["doc_id"], []).append((cid, text, meta))
 
     context_parts: list[str] = []
-    sources: list[dict] = []
-    seen: set = set()
+    source_acc = _source_acc()
 
     for doc in capped:
         items = by_doc.get(doc["doc_id"], [])
@@ -534,12 +591,9 @@ async def _catalog_context(
 
         for _, text, meta in chosen:
             context_parts.append(f"[{meta['filename']}, page {meta['page']}]\n{text}")
-            key = (meta["doc_id"], meta["page"])
-            if key not in seen:
-                seen.add(key)
-                sources.append({"filename": meta["filename"], "page": meta["page"], "doc_id": meta["doc_id"]})
+            _add_source(source_acc, meta)
 
-    return (context_parts, sources) if context_parts else None
+    return (context_parts, _finalize_sources(source_acc)) if context_parts else None
 
 
 async def _retrieve(question: str, folder_filter: str | None = None) -> tuple[str, list] | None:
@@ -729,7 +783,7 @@ async def _retrieve(question: str, folder_filter: str | None = None) -> tuple[st
     if missing_neighbors:
         sem_hits.update(await store.get_by_ids(list(missing_neighbors), distance=996.0))
 
-    context_parts, sources, seen = [], [], set()
+    context_parts, source_acc = [], _source_acc()
     context_cids_used: set[str] = set()
     for cid in top_ids:
         _, meta, _ = sem_hits[cid]
@@ -754,12 +808,9 @@ async def _retrieve(question: str, folder_filter: str | None = None) -> tuple[st
             context_cids_used.add(cid)
 
         context_parts.append(f"[{meta['filename']}, page {meta['page']}]\n{text}")
-        key = (meta["doc_id"], meta["page"])
-        if key not in seen:
-            seen.add(key)
-            sources.append({"filename": meta["filename"], "page": meta["page"], "doc_id": meta["doc_id"]})
+        _add_source(source_acc, meta)
 
-    return context_parts, sources
+    return context_parts, _finalize_sources(source_acc)
 
 
 def _retrieval_query(question: str, history: list[dict] | None) -> str:

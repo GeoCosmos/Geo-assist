@@ -17,7 +17,25 @@ These are non-negotiable constraints that must drive every design and implementa
 3. **Fully local, air-gapped** — no data may leave the machine under any circumstances. No cloud API calls, no telemetry, no external model endpoints. All models (embeddings + chat) must run via Ollama locally.
 4. **Inference from documents** — the system must reason across ingested content to surface best practices, patterns, and recommendations that aren't stated verbatim. Retrieval alone is not enough; the LLM prompt must be designed to synthesize and infer, not just quote.
 
-## Target hardware
+## Deployment (primary, as of 2026-08)
+
+Docker Compose on a Linux VM, compose file at `/opt/geo-assist/docker-compose.yml`,
+project `geo-assist`. Three containers: `geo-assist-app`, `geo-assist-ollama`,
+`geo-assist-qdrant`. A version-controlled reference copy lives at
+`deploy/docker-compose.yml` — apply changes on the VM, then mirror them there.
+
+The app image **bakes in the source** (`build: ./app`), so shipping a code change
+is `docker compose build app && docker compose up -d app`, not a file copy. The VM
+user is not in the `docker` group, so every docker command needs `sudo`.
+
+`config.DATA_DIR` is `/app/data` and **must** be bind-mounted (`./data:/app/data`).
+Without it, every rebuild destroys `data/originals/` — which is unrecoverable, and
+makes every citation's source link 404 permanently.
+
+The Windows `start.bat` / `start.ps1` path below still works and is what the
+release zips ship, but it is no longer the primary deployment.
+
+## Target hardware (Windows release path)
 
 **Primary:** Dell Precision 3260 (Windows 10/11 Pro)
 - CPU: Intel 12th-Gen Core i5-12500 / i7-12700 / i9-12900
@@ -109,7 +127,7 @@ GEO_CHAT_MODEL=qwen3.5:4b python3 -m uvicorn main:app --host 127.0.0.1 --port 87
 
 Pushing a tag matching `v*` (e.g. `git tag v1.1.0 && git push origin v1.1.0`) triggers `.github/workflows/release.yml`, which zips the repo three times via `git archive` and publishes them to a GitHub Release. Each zip is trimmed to runtime-only files via `git archive` pathspec excludes (`:(exclude)path`):
 
-- `COMMON_EXCLUDES` drops dev-only paths from all three zips — `tests/`, `docs/`, `.github/`, `CLAUDE.md`, `pytest.ini`, `.gitignore`, `migrate_to_qdrant.py` (a one-off migration script, not part of the app), and `handoff.md` (internal notes — gitignored, but excluded explicitly so it cannot ship if ever committed).
+- `COMMON_EXCLUDES` drops dev-only paths from all three zips — `tests/`, `docs/`, `.github/`, `CLAUDE.md`, `pytest.ini`, `.gitignore`, and `handoff.md` (internal notes — gitignored, but excluded explicitly so it cannot ship if ever committed).
 - The Qdrant binary is **not** in the repo or the zips. Ship `qdrant/qdrant[.exe]` alongside the release archive, or have the target machine download it once.
 - Per-OS excludes drop the other OSes' start scripts — `geo-assist-windows-*.zip` ships only `start.bat`/`start.ps1`, `geo-assist-macos-*.zip` only `start_mac.sh`, `geo-assist-linux-*.zip` only `start_linux.sh`.
 
@@ -133,7 +151,7 @@ No system binary required — pure pip install. The easyocr model downloads once
 python3 -m pytest tests/ -v
 ```
 
-All tests run without a real Ollama — embeddings and chat are mocked with deterministic fakes. Each test gets an isolated ChromaDB via `tmp_path` and a reset BM25 index.
+All tests run without a real Ollama — embeddings and chat are mocked with deterministic fakes. Each test gets an isolated Qdrant store in `tmp_path` (the client's local/embedded mode, which needs no running server) and a reset BM25 index.
 
 ```bash
 # Single file
@@ -153,16 +171,25 @@ geo-assist/
 ├── ingest.py        File parsing, chunking, embedding, storage
 ├── retriever.py     Hybrid RAG pipeline (semantic + BM25 + RRF)
 ├── bm25_index.py    Incremental BM25 index, persisted between restarts
-├── migrate_to_qdrant.py  One-off ChromaDB → Qdrant migration
+├── nas.py           NAS share walker — junk exclusion, path containment
+├── nas_manifest.py  SQLite record of which NAS files have been ingested
+├── ingest_nas.py    NAS scan driver (walk → manifest diff → batch ingest)
+├── deploy/
+│   └── docker-compose.yml  Reference copy of the VM deployment
 ├── static/
 │   └── index.html   Single-file frontend (vanilla JS, no build step)
 ├── tests/
-│   ├── conftest.py          Fixtures: isolated ChromaDB, mock Ollama
+│   ├── conftest.py          Fixtures: isolated Qdrant (local mode), mock Ollama
 │   ├── test_ingest.py       Parsing + chunking + pipeline tests
 │   ├── test_retriever.py    RAG accuracy tests (incl. hybrid BM25 rescue)
+│   ├── test_nas.py          Walker: exclusion, folder mapping, containment
+│   ├── test_nas_manifest.py Manifest: change detection, resume
+│   ├── test_ingest_nas.py   Scan driver: incremental ingest, mount loss
 │   └── test_api.py          FastAPI endpoint tests
 └── data/
-    └── chroma_db/   Persisted vector store (gitignored)
+    ├── qdrant/           Persisted vector store (gitignored)
+    ├── originals/        Source files, for citation links (gitignored)
+    └── nas_manifest.db   NAS scan state (gitignored)
 ```
 
 ## RAG pipeline
@@ -218,14 +245,46 @@ Bulk ingest flushes to the store every `_WRITE_FLUSH_EVERY` (25) files instead o
 
 ## Bulk ingest / reindex scripts
 
-`reindex.py` and `resume_reindex.py` both accept `--folder <name>` to assign all ingested documents to a named folder (default: `"General"`):
+`reindex.py` accepts `--folder <name>` to assign all ingested documents to a named folder (default: `"General"`):
 
 ```bash
 python3 reindex.py --dir ~/my-docs --folder "Project Alpha"
-python3 resume_reindex.py --dir ~/my-docs --folder "Project Alpha"
 ```
 
-Both scripts defer `bm25_index.commit()` to a single call at the end (not after every batch) — do not change this.
+It defers `bm25_index.commit()` to a single call at the end (not after every batch) — do not change this.
+
+**It is only safe with the server stopped.** BM25 is in-memory state persisted
+to a pickle by atomic replace. A second process that loads the pickle, adds to it,
+and writes it back while the server holds a stale in-memory copy loses whichever
+write lands first. This is why NAS ingestion is a route rather than a script — see
+below.
+
+## NAS ingestion
+
+`nas.py` (walk + policy) → `nas_manifest.py` (what's been seen) → `ingest_nas.py`
+(driver) → `POST /ingest/nas/{health,preview,scan}` in `main.py`. Runs **inside the
+server process** for the BM25 reason above.
+
+The share is bind-mounted read-only at `GEO_NAS_ROOT` (default `/app/documents`),
+so the app has no write path to the NAS regardless of code. Routes accept a
+*relative* subpath only — never an absolute path — resolved and containment-checked
+by `nas.resolve_subpath()`.
+
+Re-scans are cheap because `data/nas_manifest.db` keys on `(relpath, size, mtime)`:
+unchanged files are skipped without being read. `doc_id` is a content hash, so
+without the manifest the only way to know a file has been seen is to read every
+byte — the difference between a re-scan in seconds and one in hours over CIFS.
+
+Two non-obvious invariants:
+
+- **Skip, don't rewrite.** A file already in the store is skipped rather than
+  re-ingested. `doc_id` is a content hash, so a document filed by hand into one
+  folder would otherwise be silently reclassified into its NAS folder.
+- **`fatal_exceptions` in `_run_batch`.** The mount-loss circuit breaker raises
+  `NasUnreachable` from inside a loader. Without that parameter, `_run_batch`'s
+  per-file handler swallows it as one more failed file and the job reports "done"
+  against a dead mount. `tests/test_ingest_nas.py::test_mount_loss_aborts_the_job`
+  pins this.
 
 **BM25 is now incremental.** `bm25_index` keeps the tokenised corpus in memory and persists it alongside the index, so adding or deleting a document only tokenises the chunks that changed. `add()` / `remove_doc()` mark the index dirty; `commit()` re-fits and saves. The old `rebuild(col)` re-read the entire corpus from the database and re-ran the Snowball stemmer over every chunk on *every single ingest and delete* — ingesting 500 files one at a time meant 500 full rebuilds. `rebuild_from_store()` still exists but is only the cold-start fallback; keep it off the hot path.
 
@@ -258,8 +317,8 @@ ruff check --fix .
 
 ## Known non-issues
 
-- ChromaDB prints `"capture() takes 1 positional argument"` telemetry warnings — harmless.
 - `asyncio.iscoroutinefunction` deprecation warnings from FastAPI/Starlette on Python 3.14 — third-party issue, not ours.
+- SWIG `DeprecationWarning`s during tests come from PyMuPDF — harmless.
 
 ## Qdrant
 
@@ -270,17 +329,6 @@ Qdrant runs as a **server process**, started by the platform start script and bo
 Chunk IDs keep the `{doc_id}_{page}_{chunk_index}` scheme. Qdrant only accepts UUID/int point IDs, but the Haystack integration maps each string ID through a deterministic uuid5 and keeps the original in the payload, so ID-derived logic (`endswith("_1_-1")`, neighbour reconstruction) is unaffected.
 
 Qdrant returns cosine **similarity**; Chroma returned cosine **distance**. `store.py` converts via `1.0 - score` so `DISTANCE_THRESHOLD` and the injection sentinels (991.0–999.0) keep their meaning. Don't remove that conversion without auditing every comparison in `retriever.py`.
-
-### Migrating an existing ChromaDB
-
-```bash
-pip install "chromadb>=0.6,<1.0"        # only needed for the migration
-python3 migrate_to_qdrant.py --dry-run  # check what would happen
-python3 migrate_to_qdrant.py            # reuses stored vectors, no re-embedding
-python3 migrate_to_qdrant.py --verify-only
-```
-
-Stored embeddings are copied as-is, so a 148k-chunk corpus migrates in minutes rather than the hours a re-ingest would take. `doc_number`/`revision` are new fields and stay `—` until you run `--backfill-catalog` (one LLM call per document) or re-ingest. Figures are not backfillable — the old pipeline discarded image bytes; re-ingest a file to persist its figures. The legacy database is only read, never modified.
 
 ## Air-gap enforcement
 
@@ -293,7 +341,7 @@ Requirement 3 ("no data leaves the machine") is enforced in code and pinned by `
 
 ## Known issues
 
-- ~~**ChromaDB 1.x Rust backend hangs on large databases.**~~ — resolved by the move to Qdrant. ChromaDB is no longer a runtime dependency; it is only installed temporarily to run `migrate_to_qdrant.py`.
+- ~~**ChromaDB 1.x Rust backend hangs on large databases.**~~ — resolved by the move to Qdrant. ChromaDB is gone entirely: no longer a dependency, and the one-off migration script was removed once the migration completed.
 
 
 ## Frontend design system

@@ -152,11 +152,32 @@ python3 reindex.py --dir ~/Desktop/my-docs
 python3 reindex.py --dir ~/Desktop/my-docs --limit 50   # first 50 files only
 ```
 
-Resume an interrupted re-index without wiping:
+## Ingesting from a NAS share
 
-```bash
-python3 resume_reindex.py --dir ~/Desktop/my-docs
-```
+Mount the share read-only into the container and point `GEO_NAS_ROOT` at it — see
+`deploy/docker-compose.yml` for the bind. The sidebar then shows **Scan NAS
+folder**: pick a subfolder, hit Preview for a count of what would be ingested,
+then Start. Progress reuses the normal ingest bar.
+
+Re-running a scan only ingests what is new or changed. A local manifest at
+`data/nas_manifest.db` records each file's size and mtime, so unchanged files are
+skipped without being read — which is what keeps a re-scan of a large share cheap
+over SMB. Deleting that file forces a full re-scan: safe, but slow.
+
+NAS subfolders become document folders. A file already in the index is skipped
+rather than rewritten, so a document you filed by hand into one folder keeps that
+folder even if the identical bytes also live on the share. **The share is never
+written to** — the container mounts it `:ro`.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GEO_NAS_ROOT` | `/app/documents` | Share root as seen inside the container |
+| `GEO_NAS_IO_ERROR_LIMIT` | `10` | Read failures before a scan aborts with "NAS unreachable" |
+
+If the sidebar button never appears, check `GET /ingest/nas/health`. It reports
+`missing` (no bind mount), `unreadable` (usually the container UID not matching
+the CIFS mount's `uid=` option), or `ok` — those first two are otherwise
+indistinguishable from an empty share.
 
 ## Running tests
 

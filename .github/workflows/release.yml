@@ -25,7 +25,7 @@ jobs:
           # Dev-only paths, irrelevant to running the app. Full source (incl.
           # tests/docs) is always available via GitHub's automatic per-tag
           # "Source code" archive, so nothing is lost by trimming these here.
-          COMMON_EXCLUDES="tests docs .github CLAUDE.md pytest.ini .gitignore handoff.md migrate_to_qdrant.py benchmark_models.py"
+          COMMON_EXCLUDES="tests docs .github CLAUDE.md pytest.ini .gitignore handoff.md benchmark_models.py"
           for OS in windows macos linux; do
             case "$OS" in
               windows) OS_EXCLUDES="start_mac.sh start_linux.sh" ;;

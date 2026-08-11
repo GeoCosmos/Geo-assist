@@ -16,8 +16,10 @@ from pydantic import BaseModel
 import bm25_index
 import config
 import ingest
+import ingest_nas
 import jobs
 import llm
+import nas
 import retriever
 import store
 
@@ -149,6 +151,70 @@ async def ingest_status(job_id: str):
     }
 
 
+class NasScanRequest(BaseModel):
+    subpath: str = ""
+    reingest: bool = False
+
+
+@app.get("/ingest/nas/health")
+async def nas_health():
+    """Liveness of the NAS mount, checked on every call rather than at startup.
+
+    Separates "missing", "unreadable", and "empty" because they are
+    indistinguishable from the outside and have completely different fixes: a
+    missing bind mount, a UID mismatch against the CIFS mount, and a genuinely
+    empty share. Also returns the immediate subdirectories, which populate the
+    UI's subfolder picker.
+    """
+    root = config.NAS_ROOT
+    if not root or not os.path.isdir(root):
+        return {"available": False, "reason": "missing", "root": root, "subfolders": []}
+    if not os.access(root, os.R_OK | os.X_OK):
+        return {"available": False, "reason": "unreadable", "root": root, "subfolders": []}
+    try:
+        entries = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: sorted(
+                e.name for e in os.scandir(root)
+                if e.is_dir(follow_symlinks=False)
+                and e.name not in nas.EXCLUDED_DIRS
+                and not e.name.startswith(".")
+            )
+        )
+    except OSError as exc:
+        return {"available": False, "reason": "unreadable", "root": root,
+                "subfolders": [], "detail": str(exc)}
+    return {"available": True, "reason": "ok", "root": root, "subfolders": entries}
+
+
+@app.post("/ingest/nas/preview")
+async def nas_preview(req: NasScanRequest):
+    try:
+        return await ingest_nas.preview(req.subpath, reingest=req.reingest)
+    except ValueError as exc:
+        raise HTTPException(403, str(exc))
+    except ingest_nas.NasUnreachable as exc:
+        raise HTTPException(503, str(exc))
+
+
+@app.post("/ingest/nas/scan")
+async def nas_scan(req: NasScanRequest):
+    # Validate containment before creating a job, so a rejected path surfaces as
+    # an immediate 403 rather than as a failed background job the user has to go
+    # and read the status of.
+    try:
+        nas.resolve_subpath(req.subpath)
+    except ValueError as exc:
+        raise HTTPException(403, str(exc))
+
+    job = jobs.create(total=0)
+    task = asyncio.create_task(
+        ingest_nas.scan_and_ingest(req.subpath, job, reingest=req.reingest)
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return {"job_id": job.id, "total": job.total}
+
+
 @app.get("/documents")
 async def list_documents():
     return {"documents": await ingest.list_documents()}
@@ -178,10 +244,42 @@ _DOC_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 async def get_document_file(doc_id: str):
     if not _DOC_ID_RE.match(doc_id):
         raise HTTPException(404, "Document not found")
+    # Distinguish a storage-configuration fault from a per-document one. The
+    # previous single message asserted "ingested before this feature was added"
+    # even when the entire originals directory was missing — which is what
+    # happens when the data directory is not persisted, and says nothing about
+    # the document.
+    if not os.path.isdir(config.ORIGINALS_DIR):
+        raise HTTPException(
+            404,
+            "Source files are not available on this server — the data directory "
+            "is not persisted.",
+        )
     matches = glob.glob(os.path.join(config.ORIGINALS_DIR, f"{doc_id}.*"))
     if not matches:
-        raise HTTPException(404, "Original file not available (ingested before this feature was added)")
+        raise HTTPException(
+            404,
+            "No source file stored for this document. It was ingested before "
+            "source files were kept, or the file was removed.",
+        )
     return FileResponse(matches[0], headers={"Content-Disposition": "inline"})
+
+
+@app.get("/documents/{doc_id}/figures/{page}/{idx}")
+async def get_document_figure(doc_id: str, page: int, idx: int):
+    """Serve one extracted figure.
+
+    The path is built from three validated components rather than accepted from
+    the client, so there is no traversal surface: doc_id must be 16 hex
+    characters, and page/idx are integers by FastAPI's path converter.
+    """
+    if not _DOC_ID_RE.match(doc_id):
+        raise HTTPException(404, "Document not found")
+    path = ingest._image_path(doc_id, page, idx)
+    if not os.path.isfile(path):
+        raise HTTPException(404, "Figure not available")
+    return FileResponse(path, media_type="image/jpeg",
+                        headers={"Content-Disposition": "inline"})
 
 
 @app.delete("/documents/{doc_id}")
