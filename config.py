@@ -112,7 +112,7 @@ KEEP_UNCAPTIONED_IMAGES = os.environ.get("GEO_KEEP_IMAGES", "true").lower() == "
 
 # ── NAS ingestion ─────────────────────────────────────────────────────────────
 # Root of the mounted document share, as seen *inside* this container. The host
-# CIFS mount is bind-mounted here read-only (see deploy/docker-compose.yml), so
+# CIFS mount is bind-mounted here read-only (see the compose file on the VM), so
 # the app has no write path to the NAS regardless of what the code does.
 #
 # Whether a NAS is actually present is deliberately not a constant here: an
