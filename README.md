@@ -154,8 +154,9 @@ python3 reindex.py --dir ~/Desktop/my-docs --limit 50   # first 50 files only
 
 ## Ingesting from a NAS share
 
-Mount the share read-only into the container and point `GEO_NAS_ROOT` at it — see
-`deploy/docker-compose.yml` for the bind. The sidebar then shows **Scan NAS
+Mount the share read-only into the container and point `GEO_NAS_ROOT` at it (the
+container path defaults to `/app/documents`; the bind lives in the compose file on
+the VM). The sidebar then shows **Scan NAS
 folder**: pick a subfolder, hit Preview for a count of what would be ingested,
 then Start. Progress reuses the normal ingest bar.
 

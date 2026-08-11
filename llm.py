@@ -27,6 +27,40 @@ _embed_sem = asyncio.Semaphore(config.EMBED_CONCURRENCY)
 _chat_sem  = asyncio.Semaphore(config.CHAT_CONCURRENCY)
 
 
+def _log_stats(chunk: dict, model: str, thinking_chars: int = 0) -> None:
+    """Log Ollama's own timing counters from a final ("done") response.
+
+    These three numbers are what separate the causes of a slow answer, and every
+    one of them used to be discarded — the done chunk carries empty content, so
+    the `if token:` filter in chat_stream dropped it whole:
+
+      load_duration      large  → the model was (re)loaded for this request
+      prompt_eval_count  large  → the assembled context is oversized
+      eval_count >> visible tokens → the model spent the time on hidden reasoning
+
+    Without them a 6-minute answer is indistinguishable from a hung process.
+    """
+    ns = 1_000_000_000
+    log.info(
+        "ollama %s: load=%.1fs prompt=%d tok/%.1fs eval=%d tok/%.1fs thinking=%d chars",
+        model,
+        chunk.get("load_duration", 0) / ns,
+        chunk.get("prompt_eval_count", 0),
+        chunk.get("prompt_eval_duration", 0) / ns,
+        chunk.get("eval_count", 0),
+        chunk.get("eval_duration", 0) / ns,
+        thinking_chars,
+    )
+    if thinking_chars:
+        # Not cosmetic: reasoning is generated at full token cost and then thrown
+        # away, so this is pure latency the user waits through staring at nothing.
+        log.warning(
+            "%s returned %d chars of reasoning that were never shown — "
+            '"think": false is not taking effect on this server/model',
+            model, thinking_chars,
+        )
+
+
 def _build_messages(system: str, user: str, history: list[dict] | None) -> list[dict]:
     messages = [{"role": "system", "content": system}]
     if history:
@@ -68,7 +102,13 @@ async def chat(
             },
         )
         r.raise_for_status()
-        return r.json()["message"]["content"]
+        body    = r.json()
+        message = body.get("message", {})
+        _log_stats(body, model or config.CHAT_MODEL, len(message.get("thinking") or ""))
+        # A reasoning model can spend its whole budget on `thinking` and return no
+        # `content` at all. Callers here are ingest summaries and doc-number
+        # extraction, which handle an empty string — but not a KeyError.
+        return message.get("content", "")
 
 
 async def chat_stream(
@@ -96,12 +136,21 @@ async def chat_stream(
         },
     ) as r:
         r.raise_for_status()
+        thinking_chars = 0
         async for line in r.aiter_lines():
             if line:
                 chunk = json.loads(line)
-                token = chunk.get("message", {}).get("content", "")
+                message = chunk.get("message", {})
+                # Reasoning models return chain-of-thought in `thinking`, not
+                # `content`. It is deliberately not yielded — it is not an answer —
+                # but it is measured, because it is generated at full token cost and
+                # is the difference between "the model is working" and "we are hung".
+                thinking_chars += len(message.get("thinking") or "")
+                token = message.get("content", "")
                 if token:
                     yield token
+                if chunk.get("done"):
+                    _log_stats(chunk, model or config.CHAT_MODEL, thinking_chars)
 
 
 async def reachable() -> bool:

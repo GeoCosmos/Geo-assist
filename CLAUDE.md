@@ -21,8 +21,10 @@ These are non-negotiable constraints that must drive every design and implementa
 
 Docker Compose on a Linux VM, compose file at `/opt/geo-assist/docker-compose.yml`,
 project `geo-assist`. Three containers: `geo-assist-app`, `geo-assist-ollama`,
-`geo-assist-qdrant`. A version-controlled reference copy lives at
-`deploy/docker-compose.yml` — apply changes on the VM, then mirror them there.
+`geo-assist-qdrant`. The compose file and the app `Dockerfile` are **not** tracked
+in this repo — the VM holds the only copy. Read it there rather than from version
+control, and keep a backup off the box: losing it loses the record of how this is
+actually deployed.
 
 The app image **bakes in the source** (`build: ./app`), so shipping a code change
 is `docker compose build app && docker compose up -d app`, not a file copy. The VM
@@ -174,8 +176,6 @@ geo-assist/
 ├── nas.py           NAS share walker — junk exclusion, path containment
 ├── nas_manifest.py  SQLite record of which NAS files have been ingested
 ├── ingest_nas.py    NAS scan driver (walk → manifest diff → batch ingest)
-├── deploy/
-│   └── docker-compose.yml  Reference copy of the VM deployment
 ├── static/
 │   └── index.html   Single-file frontend (vanilla JS, no build step)
 ├── tests/
