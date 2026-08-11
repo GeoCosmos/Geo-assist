@@ -93,7 +93,7 @@ Pure filesystem policy — no ingestion, no HTTP, no manifest.
 - Produces:
   - `NasFile` dataclass with fields `abs_path: str`, `relpath: str`, `size: int`, `mtime: float`, `folder: str`, `ext: str`
   - `resolve_subpath(subpath: str) -> Path` — raises `ValueError` on escape
-  - `scan(root: Path) -> tuple[list[NasFile], dict[str, int]]` — returns files and a counts dict with keys `unsupported`, `oversized`, `excluded`
+  - `scan(root: Path, base: Path | None = None) -> tuple[list[NasFile], dict[str, int]]` — returns files and a counts dict with keys `unsupported`, `oversized`, `excluded`. `base` is what relpaths are measured against and defaults to `root`; callers scanning a subfolder must pass the share root, or a file's manifest key and folder change with the scan scope.
   - `folder_for(relpath: str) -> str`
   - `SUPPORTED_EXTS: set[str]`
 
