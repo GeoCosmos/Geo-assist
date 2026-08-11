@@ -491,6 +491,20 @@ a.source-chip:visited { color: #0ea5e9; }
 .source-chip:hover { background: rgba(14,165,233,.14); }
 .source-chip::before { content: "📄"; font-size: 10px; }
 
+/* Grouped citations: one chip per document, each cited page its own link. */
+.src-page { color: var(--accent); text-decoration: none; }
+a.src-page:hover { text-decoration: underline; }
+/* No source file stored — readable, but visibly not a link. */
+.source-chip.no-file { opacity: .65; }
+.source-chip.no-file .src-page { color: inherit; }
+.fig-row { display: flex; gap: 6px; flex-basis: 100%; margin: 2px 0 4px; }
+.fig-thumb img {
+  max-height: 64px; max-width: 96px;
+  border: 1px solid rgba(14,165,233,.25); border-radius: 4px;
+  object-fit: cover; display: block;
+}
+.fig-thumb:hover img { border-color: var(--accent); }
+
 .empty-state {
   margin: auto;
   text-align: center;
@@ -1562,6 +1576,40 @@ function escHtml(s) {
 }
 
 function renderSourceChip(s) {
+  // Sources replayed from localStorage predate grouping: they carry a single
+  // `page` and no `pages` array. Without this branch every saved conversation
+  // loses its citations.
+  if (!Array.isArray(s.pages)) return renderLegacySourceChip(s);
+
+  const id = encodeURIComponent(s.doc_id);
+  const name = escHtml(s.filename);
+  const pages = s.pages.filter(p => p > 0);
+
+  let pagePart = '';
+  if (pages.length) {
+    const rendered = pages.map(p => s.has_original
+      ? `<a class="src-page" href="/documents/${id}/file#page=${p}" target="_blank" rel="noopener">${p}</a>`
+      : `<span class="src-page">${p}</span>`).join(', ');
+    pagePart = ` · p.${rendered}`;
+  }
+
+  // No source file on disk: render as text rather than a link that 404s. The
+  // backend now tells us, so a dead link is never offered in the first place.
+  const title = s.has_original ? ''
+    : ' title="Source file not stored for this document — nothing to open."';
+  const chip = `<span class="source-chip${s.has_original ? '' : ' no-file'}"${title}>${name}${pagePart}</span>`;
+
+  const figures = (s.figures || []).map(f => {
+    const url = `/documents/${id}/figures/${f.page}/${f.idx}`;
+    return `<a href="${url}" target="_blank" rel="noopener" class="fig-thumb">`
+         + `<img src="${url}" alt="Figure from page ${f.page}" loading="lazy"`
+         + ` onerror="this.parentNode.style.display='none'"></a>`;
+  }).join('');
+
+  return chip + (figures ? `<span class="fig-row">${figures}</span>` : '');
+}
+
+function renderLegacySourceChip(s) {
   const label = `${escHtml(s.filename)}${s.page > 0 ? `, p.${s.page}` : ''}`;
   if (!s.doc_id) return `<span class="source-chip">${label}</span>`;
   const href = `/documents/${encodeURIComponent(s.doc_id)}/file${s.page > 0 ? `#page=${s.page}` : ''}`;
