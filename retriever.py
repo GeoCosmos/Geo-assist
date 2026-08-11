@@ -152,6 +152,16 @@ def _finalize_sources(acc: dict) -> list[dict]:
 _RRF_K = 60
 _EXPAND_WINDOW = 2  # neighbor chunks fetched on each side for parent-chunk retrieval
 
+# Table completeness bounds. A table_id covering more chunks than _TABLE_MAX_CHUNKS
+# is a table-detection false positive, not a table — DOCX/PDF extraction happily
+# tags long runs of prose. Expanding one drags a large slice of the document into
+# the prompt: measured live at ~150 context chunks and 13,480 prompt tokens, which
+# cost 573s of prompt evaluation on CPU before the model emitted a single token.
+# _TABLE_EXPANSION_BUDGET bounds the total across all tables in one query, since
+# several individually-plausible tables can still add up.
+_TABLE_MAX_CHUNKS = 24
+_TABLE_EXPANSION_BUDGET = 32
+
 
 _NAMED_DOC_MIN_STEM = 6
 
@@ -788,10 +798,21 @@ async def _retrieve(question: str, folder_filter: str | None = None) -> tuple[st
     if table_ids_in_context:
         t_where = _with_folder(store.in_("table_id", list(table_ids_in_context)), folder_filter)
         t_hits = await store.get_by_filter(t_where, distance=995.0)
+        # Drop tables too large to be tables before anything is added to context.
+        per_table: dict[str, list] = {}
+        for cid, hit in t_hits.items():
+            per_table.setdefault(hit[1].get("table_id", ""), []).append((cid, hit))
+        plausible: list = []
+        for tid, items in per_table.items():
+            if len(items) > _TABLE_MAX_CHUNKS:
+                log.info("table %s spans %d chunks — treating as a parse artifact, "
+                         "skipping expansion", tid, len(items))
+                continue
+            plausible.extend(items)
         paired = sorted(
-            t_hits.items(),
+            plausible,
             key=lambda kv: (kv[1][1]["page"], kv[1][1].get("chunk_index", 0)),
-        )
+        )[:_TABLE_EXPANSION_BUDGET]
         table_cids_ordered: list[str] = []
         for cid, hit in paired:
             if cid not in sem_hits:
