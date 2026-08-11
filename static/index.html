@@ -187,6 +187,48 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); }
   flex-shrink: 0;
 }
 #folder-input-row span { font-size: 12px; color: var(--sidebar-muted); flex-shrink: 0; }
+
+/* NAS scan — hidden until /ingest/nas/health confirms a usable mount, so an
+   install with no share attached never shows a button that only errors. */
+#nas-row { display: none; margin: 0 12px 4px; flex-shrink: 0; }
+#nas-btn {
+  width: 100%;
+  background: rgba(255,255,255,.04);
+  border: 1px solid rgba(14,165,233,.18);
+  border-radius: 6px;
+  color: var(--sidebar-text);
+  font-size: 11.5px;
+  padding: 5px 8px;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color .15s, background .15s;
+}
+#nas-btn:hover { border-color: var(--accent); background: rgba(14,165,233,.08); }
+#nas-panel { display: none; margin-top: 5px; }
+#nas-subpath {
+  width: 100%;
+  background: rgba(255,255,255,.05);
+  border: 1px solid rgba(14,165,233,.15);
+  border-radius: 6px;
+  color: var(--sidebar-text);
+  font-size: 11.5px;
+  padding: 4px 6px;
+  outline: none;
+}
+#nas-actions { display: flex; gap: 5px; margin-top: 5px; }
+#nas-actions button {
+  flex: 1;
+  background: rgba(255,255,255,.04);
+  border: 1px solid rgba(14,165,233,.18);
+  border-radius: 6px;
+  color: var(--sidebar-text);
+  font-size: 11px;
+  padding: 4px 6px;
+  cursor: pointer;
+}
+#nas-actions button:hover:not(:disabled) { border-color: var(--accent); }
+#nas-actions button:disabled { opacity: .4; cursor: default; }
+#nas-summary { font-size: 10.5px; color: var(--sidebar-muted); margin-top: 5px; line-height: 1.4; }
 #folder-input {
   flex: 1;
   background: rgba(255,255,255,.05);
@@ -620,6 +662,17 @@ a.source-chip:visited { color: #0ea5e9; }
         <input type="text" id="folder-input" placeholder="General" list="folder-suggestions">
         <datalist id="folder-suggestions"></datalist>
       </div>
+      <div id="nas-row">
+        <button id="nas-btn" onclick="toggleNasPanel()">🗄 Scan NAS folder</button>
+        <div id="nas-panel">
+          <select id="nas-subpath"></select>
+          <div id="nas-actions">
+            <button onclick="previewNas()">Preview</button>
+            <button id="nas-start-btn" onclick="startNasScan()" disabled>Start</button>
+          </div>
+          <div id="nas-summary"></div>
+        </div>
+      </div>
       <div id="progress-bar"><div id="progress-fill"></div></div>
       <div id="ingest-label"></div>
       <div style="display:flex;align-items:center;padding:5px 12px 0;">
@@ -923,6 +976,7 @@ async function moveDoc(docId, currentFolder, btn) {
 }
 
 loadDocs();
+initNas();
 
 // ── procedure mode ────────────────────────────────────────────────────────────
 let _procState = null; // {docId, filename, stepNum, totalSteps, stepText}
@@ -1117,9 +1171,13 @@ function pollJob(jobId, total) {
       }
       const job = await r.json();
 
-      const pct = total > 0 ? Math.round((job.prepared / total) * 100) : 0;
+      // A NAS scan passes null: its total is only known once the server-side
+      // walk finishes, so the denominator comes from the job status instead of
+      // from the caller.
+      const denom = total ?? job.total ?? 0;
+      const pct = denom > 0 ? Math.round((job.prepared / denom) * 100) : 0;
       fill.style.width = pct + '%';
-      setIngestLabel(`Processing ${job.prepared} / ${total}…`);
+      setIngestLabel(denom ? `Processing ${job.prepared} / ${denom}…` : 'Scanning…');
 
       if (job.status === 'done' || job.status === 'failed') {
         clearInterval(iv);
@@ -1129,14 +1187,93 @@ function pollJob(jobId, total) {
         loadDocs();
         if (job.status === 'done') {
           const n = job.results.filter(r => r.status === 'ok').length;
-          showToast(`${n} document${n !== 1 ? 's' : ''} ready to query`);
+          const skipped = job.results.filter(r => r.status === 'skipped').length;
+          showToast(`${n} document${n !== 1 ? 's' : ''} ready to query` +
+                    (skipped ? `, ${skipped} already indexed` : ''));
         } else {
-          showToast('Ingest failed — see console for details', true);
+          showToast(job.errors[0] || 'Ingest failed — see console for details', true);
           console.error('Ingest job failed', job);
         }
       }
     } catch (e) { console.error('Status poll error', e); }
   }, 1000);
+}
+
+// ── NAS scan ──────────────────────────────────────────────────────────────────
+// The share root is fixed by the container's read-only bind mount, so the user
+// picks a subfolder rather than typing a path — the server rejects anything that
+// escapes the root anyway.
+async function initNas() {
+  try {
+    const r = await _apiFetch(`${API}/ingest/nas/health`);
+    const h = await r.json();
+    if (!h.available) return;                       // no mount: stay hidden
+    const sel = document.getElementById('nas-subpath');
+    sel.innerHTML = '<option value="">(entire share)</option>' +
+      h.subfolders.map(f => `<option value="${escHtml(f)}">${escHtml(f)}</option>`).join('');
+    document.getElementById('nas-row').style.display = 'block';
+  } catch { /* backend down — the upload path already surfaces that */ }
+}
+
+function toggleNasPanel() {
+  const p = document.getElementById('nas-panel');
+  p.style.display = p.style.display === 'block' ? 'none' : 'block';
+}
+
+async function previewNas() {
+  const subpath = document.getElementById('nas-subpath').value;
+  const out = document.getElementById('nas-summary');
+  out.textContent = 'Scanning…';
+  try {
+    const r = await _apiFetch(`${API}/ingest/nas/preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subpath }),
+    });
+    const p = await r.json();
+    if (!r.ok) { out.textContent = p.detail || 'Preview failed'; return; }
+    const mb = (p.total_bytes / 1048576).toFixed(1);
+    out.textContent =
+      `${p.new} new (${mb} MB) · ${p.unchanged} unchanged · ${p.unsupported} unsupported`;
+    document.getElementById('nas-start-btn').disabled = p.new === 0;
+  } catch {
+    out.textContent = 'Preview failed — backend unreachable';
+  }
+}
+
+async function startNasScan() {
+  if (_ingestLocked) { showToast('Ingest already in progress — please wait', true); return; }
+  const subpath = document.getElementById('nas-subpath').value;
+
+  setIngestLock(true);
+  bar.style.display = 'block';
+  fill.style.width = '0%';
+  setIngestLabel('Scanning NAS…');
+
+  let job;
+  try {
+    const r = await _apiFetch(`${API}/ingest/nas/scan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subpath }),
+    });
+    job = await r.json();
+    if (!r.ok) {
+      showToast(job.detail || 'NAS scan failed', true);
+      setIngestLock(false);
+      bar.style.display = 'none'; fill.style.width = '0%'; setIngestLabel('');
+      return;
+    }
+  } catch {
+    showToast('NAS scan failed — backend unreachable', true);
+    setIngestLock(false);
+    bar.style.display = 'none'; fill.style.width = '0%'; setIngestLabel('');
+    return;
+  }
+
+  // The walk happens server-side after this response returns, so the total is
+  // not known yet — pass null and let pollJob read it from the job status.
+  pollJob(job.job_id, null);
 }
 
 // ── conversation management ───────────────────────────────────────────────────
