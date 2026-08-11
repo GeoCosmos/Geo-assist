@@ -4,6 +4,7 @@ Tests for the RAG retrieval pipeline.
 Key scenario: a transcript document contains GPA information.
 We verify the correct chunks are retrieved and passed to the LLM.
 """
+import os
 from unittest.mock import patch
 
 import pytest
@@ -426,3 +427,64 @@ async def test_catalog_stream_serves_stored_metadata(mock_ollama, monkeypatch):
     assert "qual.txt" in table
     assert "GCA-9001" in table
     assert "3.10" in table
+
+
+# ── citation source grouping ──────────────────────────────────────────────────
+
+def test_source_accumulator_groups_pages_under_one_document():
+    acc = retriever._source_acc()
+    for page in (10, 1, 30, 10):
+        retriever._add_source(acc, {"doc_id": "a" * 16, "filename": "m.pdf", "page": page})
+    out = retriever._finalize_sources(acc)
+    assert len(out) == 1
+    assert out[0]["pages"] == [1, 10, 30]
+    assert out[0]["page"] == 1          # legacy field: lowest cited page
+
+
+def test_source_accumulator_preserves_first_citation_order():
+    acc = retriever._source_acc()
+    retriever._add_source(acc, {"doc_id": "b" * 16, "filename": "second.pdf", "page": 2})
+    retriever._add_source(acc, {"doc_id": "a" * 16, "filename": "first.pdf", "page": 1})
+    retriever._add_source(acc, {"doc_id": "b" * 16, "filename": "second.pdf", "page": 9})
+    assert [s["filename"] for s in retriever._finalize_sources(acc)] == ["second.pdf", "first.pdf"]
+
+
+def test_figure_chunk_attaches_to_the_same_document_entry():
+    """The bug grouping fixes: under the old (doc_id, page) dedup a figure on a
+    page that also contributed a text chunk was dropped and never surfaced."""
+    acc = retriever._source_acc()
+    retriever._add_source(acc, {"doc_id": "a" * 16, "filename": "m.pdf", "page": 3})
+    retriever._add_source(acc, {
+        "doc_id": "a" * 16, "filename": "m.pdf", "page": 3,
+        "chunk_type": "image", "chunk_index": ingest._IMAGE_CHUNK_IDX_BASE - 0,
+    })
+    out = retriever._finalize_sources(acc)
+    assert len(out) == 1
+    assert out[0]["figures"] == [{"page": 3, "idx": 0}]
+
+
+def test_figures_are_deduped():
+    acc = retriever._source_acc()
+    meta = {"doc_id": "a" * 16, "filename": "m.pdf", "page": 3,
+            "chunk_type": "image", "chunk_index": ingest._IMAGE_CHUNK_IDX_BASE - 2}
+    retriever._add_source(acc, meta)
+    retriever._add_source(acc, dict(meta))
+    assert retriever._finalize_sources(acc)[0]["figures"] == [{"page": 3, "idx": 2}]
+
+
+def test_documents_without_figures_omit_the_key():
+    acc = retriever._source_acc()
+    retriever._add_source(acc, {"doc_id": "a" * 16, "filename": "m.pdf", "page": 1})
+    assert "figures" not in retriever._finalize_sources(acc)[0]
+
+
+def test_has_original_is_reported_per_document(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path / "originals"))
+    os.makedirs(config.ORIGINALS_DIR)
+    open(os.path.join(config.ORIGINALS_DIR, f"{'a' * 16}.pdf"), "wb").write(b"x")
+
+    acc = retriever._source_acc()
+    retriever._add_source(acc, {"doc_id": "a" * 16, "filename": "kept.pdf", "page": 1})
+    retriever._add_source(acc, {"doc_id": "c" * 16, "filename": "gone.pdf", "page": 1})
+    out = {s["filename"]: s["has_original"] for s in retriever._finalize_sources(acc)}
+    assert out == {"kept.pdf": True, "gone.pdf": False}
