@@ -1,9 +1,13 @@
 """Tests for FastAPI endpoints."""
 import json
+import os
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
+import config
+import ingest_nas
 import main
 
 client = TestClient(main.app)
@@ -294,3 +298,74 @@ def test_procedure_navigate_clamps_to_bounds(mock_ollama):
     r_next = client.post("/procedure/session/sess_clamp/navigate", json={"direction": "next"})
     assert r_next.status_code == 200
     assert r_next.json()["step_num"] == r_next.json()["total_steps"]
+
+
+# ── NAS ingestion endpoints ───────────────────────────────────────────────────
+
+@pytest.fixture
+def nas_api_tree(tmp_path, monkeypatch):
+    root = tmp_path / "documents"
+    (root / "Manuals").mkdir(parents=True)
+    (root / "Manuals" / "a.txt").write_bytes(b"alpha body")
+    (root / "b.txt").write_bytes(b"beta body")
+    monkeypatch.setattr(config, "NAS_ROOT", str(root))
+    monkeypatch.setattr(config, "NAS_MANIFEST_PATH", str(tmp_path / "m.db"))
+    # The manifest is a module-level singleton; drop it so it reopens against
+    # this test's monkeypatched path rather than a previous test's database.
+    ingest_nas._manifest_singleton = None
+    yield root
+    ingest_nas._manifest_singleton = None
+
+
+def test_nas_health_reports_available_root(nas_api_tree):
+    r = client.get("/ingest/nas/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["available"] is True
+    assert body["subfolders"] == ["Manuals"]
+
+
+def test_nas_health_reports_missing_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "NAS_ROOT", str(tmp_path / "absent"))
+    body = client.get("/ingest/nas/health").json()
+    assert body["available"] is False
+    assert body["reason"] == "missing"
+
+
+def test_nas_health_distinguishes_permission_denied(tmp_path, monkeypatch):
+    """EACCES and an empty share look identical without this — and a UID mismatch
+    between the container and the CIFS mount is the likeliest deploy failure."""
+    root = tmp_path / "locked"
+    root.mkdir()
+    monkeypatch.setattr(config, "NAS_ROOT", str(root))
+    monkeypatch.setattr(os, "access", lambda p, m: False)
+    body = client.get("/ingest/nas/health").json()
+    assert body["available"] is False
+    assert body["reason"] == "unreadable"
+
+
+def test_nas_preview_returns_counts(nas_api_tree, mock_ollama):
+    r = client.post("/ingest/nas/preview", json={"subpath": ""})
+    assert r.status_code == 200
+    assert r.json()["new"] == 2
+
+
+def test_nas_preview_rejects_escape(nas_api_tree):
+    r = client.post("/ingest/nas/preview", json={"subpath": "../.."})
+    assert r.status_code == 403
+
+
+def test_nas_preview_rejects_absolute_path(nas_api_tree):
+    r = client.post("/ingest/nas/preview", json={"subpath": "/etc"})
+    assert r.status_code == 403
+
+
+def test_nas_scan_returns_job_id(nas_api_tree, mock_ollama):
+    r = client.post("/ingest/nas/scan", json={"subpath": ""})
+    assert r.status_code == 200
+    assert "job_id" in r.json()
+
+
+def test_nas_scan_rejects_escape(nas_api_tree):
+    r = client.post("/ingest/nas/scan", json={"subpath": "../../etc"})
+    assert r.status_code == 403
