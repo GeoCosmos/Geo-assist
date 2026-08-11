@@ -101,3 +101,25 @@ def test_scan_does_not_follow_symlinked_dirs(fake_nas, tmp_path):
 def test_scan_missing_root_raises_filenotfound(tmp_path):
     with pytest.raises(FileNotFoundError):
         nas.scan(tmp_path / "nope")
+
+
+def test_scan_excludes_qnap_snapshot_directories(tmp_path, monkeypatch):
+    """@Recently-Snapshot holds a complete point-in-time copy of the whole share.
+
+    Content hashing would stop duplicates reaching the store, but the scan would
+    still read and hash every file twice — and a NAS retaining daily snapshots
+    multiplies the corpus by the number of snapshots retained. Structure below is
+    taken verbatim from a real QNAP share.
+    """
+    root = tmp_path / "share"
+    (root / "Armsat_1").mkdir(parents=True)
+    (root / "Armsat_1" / "report.docx").write_bytes(b"the real document")
+    (root / "@Recycle").mkdir()
+    (root / "@Recycle" / "desktop.ini").write_bytes(b"junk")
+    snap = root / "@Recently-Snapshot" / "GMT+04_2026-08-11_0000" / "Armsat_1"
+    snap.mkdir(parents=True)
+    (snap / "report.docx").write_bytes(b"the real document")
+
+    monkeypatch.setattr(config, "NAS_ROOT", str(root))
+    files, _counts = nas.scan(root)
+    assert [f.relpath for f in files] == ["Armsat_1/report.docx"]

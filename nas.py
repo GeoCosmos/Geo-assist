@@ -19,8 +19,16 @@ MAX_FILE_BYTES = 100 * 1024 * 1024  # mirrors main.MAX_UPLOAD_BYTES
 # directory holding media, each containing files named after the originals. Left
 # in, they would roughly double the corpus with unreadable stubs. @Recycle is the
 # NAS trash. The rest is Windows/macOS/Office debris.
+#
+# @Recently-Snapshot is the dangerous one: it holds a complete point-in-time copy
+# of the entire share, one subtree per retained snapshot. Content hashing stops
+# duplicates reaching the store, but the scan would still read and hash every file
+# once per snapshot — a share keeping 30 daily snapshots would do 31× the I/O for
+# nothing. Observed on a live QNAP share as
+# @Recently-Snapshot/GMT+04_2026-08-11_0000/<the whole tree>.
 EXCLUDED_DIRS = {
     "@eaDir", "@Recycle", "#recycle", "$RECYCLE.BIN", "System Volume Information",
+    "@Recently-Snapshot", "@Snapshot",
 }
 EXCLUDED_FILE_PATTERNS = ("~$*", "Thumbs.db", "desktop.ini", ".DS_Store")
 
