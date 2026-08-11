@@ -49,15 +49,20 @@ services:
       # data/images. The bind this replaced, ./data/uploads:/app/uploads,
       # pointed at a path no code references and protected nothing.
       - ./data:/app/data
-      # Document share, read-only. The underlying CIFS mount is rw, so :ro here
-      # is the only thing keeping the app off the NAS write path.
+      # Document share, read-only. ./qnap-data is the CIFS mount holding the
+      # project folders. The underlying mount is rw, so :ro here is the only
+      # thing keeping the app off the NAS write path.
+      #
+      # This replaces the previous single-project bind
+      # (./qnap-data/<project>:/app/documents/<project>), which no code read —
+      # the whole share is exposed now and scoping happens in the UI instead.
       #
       # propagation: rslave — Docker bind mounts are point-in-time. Without it,
       # a host CIFS remount (network blip, NAS reboot) leaves the container
       # pointing at the stale mountpoint, and a scan then reports "0 new,
       # everything unchanged" instead of failing.
       - type: bind
-        source: /REPLACE/WITH/HOST/SHARE/PATH   # the CIFS mount holding the documents
+        source: ./qnap-data
         target: /app/documents
         read_only: true
         bind:
