@@ -394,3 +394,32 @@ def test_file_route_reports_per_document_absence_when_directory_exists(tmp_path,
 def test_file_route_still_rejects_a_malformed_doc_id(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path))
     assert client.get("/documents/nothex/file").status_code == 404
+
+
+# ── figure serving ────────────────────────────────────────────────────────────
+
+def test_figure_route_serves_the_image(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "IMAGES_DIR", str(tmp_path / "images"))
+    doc_id = "a" * 16
+    os.makedirs(os.path.join(config.IMAGES_DIR, doc_id))
+    open(os.path.join(config.IMAGES_DIR, doc_id, "p3_i0.jpg"), "wb").write(b"\xff\xd8jpegbytes")
+
+    r = client.get(f"/documents/{doc_id}/figures/3/0")
+    assert r.status_code == 200
+    assert r.content == b"\xff\xd8jpegbytes"
+
+
+def test_figure_route_404s_for_missing_figure(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "IMAGES_DIR", str(tmp_path / "images"))
+    assert client.get(f"/documents/{'a' * 16}/figures/9/9").status_code == 404
+
+
+def test_figure_route_rejects_malformed_doc_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "IMAGES_DIR", str(tmp_path / "images"))
+    assert client.get("/documents/nothex/figures/1/0").status_code == 404
+
+
+def test_figure_route_rejects_non_integer_page(tmp_path, monkeypatch):
+    """FastAPI's int converter rejects these before any path is constructed."""
+    monkeypatch.setattr(config, "IMAGES_DIR", str(tmp_path / "images"))
+    assert client.get(f"/documents/{'a' * 16}/figures/notanint/0").status_code == 422

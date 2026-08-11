@@ -265,6 +265,23 @@ async def get_document_file(doc_id: str):
     return FileResponse(matches[0], headers={"Content-Disposition": "inline"})
 
 
+@app.get("/documents/{doc_id}/figures/{page}/{idx}")
+async def get_document_figure(doc_id: str, page: int, idx: int):
+    """Serve one extracted figure.
+
+    The path is built from three validated components rather than accepted from
+    the client, so there is no traversal surface: doc_id must be 16 hex
+    characters, and page/idx are integers by FastAPI's path converter.
+    """
+    if not _DOC_ID_RE.match(doc_id):
+        raise HTTPException(404, "Document not found")
+    path = ingest._image_path(doc_id, page, idx)
+    if not os.path.isfile(path):
+        raise HTTPException(404, "Figure not available")
+    return FileResponse(path, media_type="image/jpeg",
+                        headers={"Content-Disposition": "inline"})
+
+
 @app.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str):
     async with ingest._lock:
