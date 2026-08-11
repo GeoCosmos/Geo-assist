@@ -210,14 +210,16 @@ Bulk ingest flushes to the store every `_WRITE_FLUSH_EVERY` (25) files instead o
 5. Semantic hits + BM25 hits merged via Reciprocal Rank Fusion (RRF, k=60); value queries get 2× BM25 weight
 6. Named-doc injection, system-name injection, summary boost, table-chunk boost (1.5× for value queries)
 7. Cross-encoder reranking — scores top 20 (query, chunk) pairs; falls back to RRF order if not installed
-8. If any top chunk has a `table_id`, all chunks sharing that ID are fetched in one batch and prepended (table completeness)
+8. If any top chunk has a `table_id`, chunks sharing that ID are fetched in one batch and prepended (table completeness) — bounded by `_TABLE_MAX_CHUNKS` per table and `_TABLE_EXPANSION_BUDGET` overall
 9. For each selected chunk, ±2 neighbours on the same page fetched and concatenated (parent-chunk expansion)
 10. Top chunks passed as context to the LLM; system prompt includes explicit source-file list to prevent hallucinated citations
 11. LLM answers with cite/calculate/infer rules enforced by system prompt
 
 **Why hybrid:** semantic search misses exact tokens (part numbers, acronyms, numeric units). BM25 rescues these. RRF combines both rankings without needing score normalisation.
 
-**Why table completeness:** PDF/DOCX tables split across chunk boundaries lose column alignment. When any chunk from a table is retrieved, injecting all sibling chunks ensures the model sees the full table.
+**Why table completeness:** PDF/DOCX tables split across chunk boundaries lose column alignment. When any chunk from a table is retrieved, injecting sibling chunks ensures the model sees the full table.
+
+**Why it is bounded:** the expansion runs *after* `_diverse_top` has capped context at 8 chunks, so an unbounded fetch silently overrides that cap. Table detection tags long runs of prose in real DOCX files; one such false-positive `table_id` put ~150 chunks and 13,480 prompt tokens into a single query, costing 573s of prompt evaluation on CPU before the first token. A `table_id` spanning more than `_TABLE_MAX_CHUNKS` is treated as a parse artifact and skipped entirely — do not remove that guard without re-measuring `prompt_eval_count` (now logged by `llm._log_stats`).
 
 **Why parent-chunk expansion:** 512-char chunks can start or end mid-sentence. Fetching ±2 neighbours gives the LLM full paragraphs with proper context boundaries.
 

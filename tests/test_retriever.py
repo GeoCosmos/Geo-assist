@@ -504,3 +504,54 @@ def test_has_original_is_reported_per_document(tmp_path, monkeypatch):
     retriever._add_source(acc, {"doc_id": "c" * 16, "filename": "gone.pdf", "page": 1})
     out = {s["filename"]: s["has_original"] for s in retriever._finalize_sources(acc)}
     assert out == {"kept.pdf": True, "gone.pdf": False}
+
+
+async def _add_table_doc(doc_id: str, table_id: str, n_chunks: int) -> None:
+    """Store one document whose chunks all carry the same table_id."""
+    docs = []
+    for i in range(n_chunks):
+        text = f"{doc_id} ground station telemetry paragraph {i} covering daily operations."
+        docs.append(store.to_document(
+            f"{doc_id}_1_{i}", text,
+            {"doc_id": doc_id, "filename": f"{doc_id}.docx", "page": 1,
+             "chunk_index": i, "folder": "General", "table_id": table_id},
+            make_embedding(text),
+        ))
+    await store.add(docs)
+
+
+async def test_oversized_table_is_not_expanded_into_context(mock_ollama):
+    """A 'table' spanning most of a document is a parse artifact, not a table.
+
+    Regression: table completeness fetched every chunk sharing a table_id with no
+    cap. On the live corpus that put ~150 chunks — a third of the whole document —
+    into one prompt: 13,480 tokens costing 573s of prompt evaluation before the
+    model wrote a single word.
+    """
+    await _add_table_doc("bigtable", "t-big", 60)
+
+    result = await retriever._retrieve("ground station telemetry daily operations")
+
+    assert result is not None
+    context_parts, _sources = result
+    assert len(context_parts) <= 12, (
+        f"table expansion put {len(context_parts)} chunks in context; "
+        "an implausibly large table must not be expanded"
+    )
+
+
+async def test_genuine_small_table_is_still_expanded(mock_ollama):
+    """The cap must not defeat table completeness for real tables.
+
+    A table split across a few chunks still has to arrive whole, or column
+    alignment is lost — which is the entire reason the feature exists.
+    """
+    await _add_table_doc("smalltable", "t-small", 5)
+
+    result = await retriever._retrieve("ground station telemetry daily operations")
+
+    assert result is not None
+    context_parts, _sources = result
+    combined = " ".join(context_parts)
+    for i in range(5):
+        assert f"paragraph {i} " in combined, f"chunk {i} of a genuine table was dropped"
