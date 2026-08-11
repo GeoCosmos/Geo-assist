@@ -67,13 +67,22 @@ def _excluded_file(name: str) -> bool:
     return any(fnmatch.fnmatch(name, pat) for pat in EXCLUDED_FILE_PATTERNS)
 
 
-def scan(root: Path) -> tuple[list[NasFile], dict[str, int]]:
+def scan(root: Path, base: Path | None = None) -> tuple[list[NasFile], dict[str, int]]:
     """Walk `root`, returning ingestable files and counts of what was passed over.
+
+    `base` is what relpaths are measured against, defaulting to `root`. Callers
+    scanning a subfolder must pass the share root, or the same file gets a
+    different identity depending on scan scope: scanning "Manuals" would key
+    Manuals/alpha.txt as "alpha.txt" and file it under folder "General", while a
+    full scan keys it "Manuals/alpha.txt" under folder "Manuals". That breaks the
+    manifest in both directions — every file looks new after switching scope, and
+    a root-level file sharing a basename collides with the subfolder one.
 
     Blocking: `stat` over CIFS is a network round trip. Callers must run this in
     an executor, never on the event loop.
     """
     root = Path(root)
+    base = Path(base) if base is not None else root
     if not root.is_dir():
         raise FileNotFoundError(f"NAS path is not a directory: {root}")
 
@@ -104,7 +113,7 @@ def scan(root: Path) -> tuple[list[NasFile], dict[str, int]]:
             if st.st_size > MAX_FILE_BYTES:
                 counts["oversized"] += 1
                 continue
-            relpath = os.path.relpath(abs_path, root).replace(os.sep, "/")
+            relpath = os.path.relpath(abs_path, base).replace(os.sep, "/")
             files.append(NasFile(
                 abs_path=abs_path,
                 relpath=relpath,

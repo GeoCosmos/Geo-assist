@@ -12,6 +12,7 @@ server holds a stale copy is last-writer-wins data loss.
 import asyncio
 import logging
 import os
+from pathlib import Path
 
 import config
 import ingest
@@ -42,9 +43,12 @@ def _manifest() -> Manifest:
 async def _walk(subpath: str) -> tuple[list, dict]:
     """Resolve, contain, and walk — off the event loop."""
     target = nas.resolve_subpath(subpath)  # raises ValueError on escape
+    # relpaths are measured from the share root, not the scanned subfolder, so a
+    # file's manifest key and folder are the same whichever scope it was found by.
+    base = Path(config.NAS_ROOT).resolve()
     loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(None, nas.scan, target)
+        return await loop.run_in_executor(None, nas.scan, target, base)
     except FileNotFoundError as exc:
         raise NasUnreachable(str(exc)) from exc
     except OSError as exc:

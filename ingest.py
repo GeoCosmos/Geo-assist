@@ -1032,6 +1032,9 @@ async def _run_batch(
         # an aborted scan resumes from where it stopped rather than from zero.
         for task in tasks:
             task.cancel()
+        # Await the cancellations before flushing, or the loop logs "Task was
+        # destroyed but it is pending" for each one as it is garbage collected.
+        await asyncio.gather(*tasks, return_exceptions=True)
         await _flush()
         raise
     await _flush()

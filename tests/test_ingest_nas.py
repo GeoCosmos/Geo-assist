@@ -156,3 +156,29 @@ async def test_errors_are_capped(nas_tree, mock_ollama, monkeypatch):
     # sheet.xlsx is appended before the cap applies.
     assert len(job.errors) <= 4
     assert any("more error" in e for e in job.errors)
+
+
+@pytest.mark.asyncio
+async def test_subfolder_scan_and_full_scan_share_manifest_keys(nas_tree, mock_ollama):
+    """relpath must be relative to the share root, not to the scan root.
+
+    Otherwise Manuals/alpha.txt is keyed "alpha.txt" by a subfolder scan and
+    "Manuals/alpha.txt" by a full scan, so the manifest misses on every file the
+    next time the user picks a different scope — and a root-level file with the
+    same basename collides with it.
+    """
+    job = jobs.create(total=0)
+    await ingest_nas.scan_and_ingest("Manuals", job)
+
+    p = await ingest_nas.preview("")
+    assert p["unchanged"] == 2, "subfolder scan did not register under share-root keys"
+    assert p["new"] == 1  # gamma.txt at the root
+
+
+@pytest.mark.asyncio
+async def test_folder_is_scan_scope_independent(nas_tree, mock_ollama):
+    """A document's folder must not depend on which subfolder the user scanned."""
+    job = jobs.create(total=0)
+    await ingest_nas.scan_and_ingest("Manuals", job)
+    docs = {d["filename"]: d["folder"] for d in await ingest.list_documents()}
+    assert docs["alpha.txt"] == "Manuals"
