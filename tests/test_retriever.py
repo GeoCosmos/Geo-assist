@@ -478,6 +478,22 @@ def test_documents_without_figures_omit_the_key():
     assert "figures" not in retriever._finalize_sources(acc)[0]
 
 
+def test_originals_directory_is_read_once_per_answer(tmp_path, monkeypatch):
+    """The catalog path finalizes every document in the corpus at once. A glob
+    per document would be O(docs x files) of stat work on the event loop."""
+    monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path / "originals"))
+    os.makedirs(config.ORIGINALS_DIR)
+    reads = []
+    real_listdir = os.listdir
+    monkeypatch.setattr(os, "listdir", lambda p: reads.append(p) or real_listdir(p))
+
+    acc = retriever._source_acc()
+    for i in range(25):
+        retriever._add_source(acc, {"doc_id": f"{i:016x}", "filename": f"d{i}.pdf", "page": 1})
+    retriever._finalize_sources(acc)
+    assert len(reads) == 1
+
+
 def test_has_original_is_reported_per_document(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path / "originals"))
     os.makedirs(config.ORIGINALS_DIR)

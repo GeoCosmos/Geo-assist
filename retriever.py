@@ -125,7 +125,13 @@ def _add_source(acc: dict, meta: dict) -> None:
 
 
 def _finalize_sources(acc: dict) -> list[dict]:
-    """Turn the accumulator into the payload sent to the client."""
+    """Turn the accumulator into the payload sent to the client.
+
+    Reads the originals directory once for the whole answer. The catalog path
+    calls this with every document in the corpus, so a per-document glob would
+    be O(docs x files) of synchronous stat work on the event loop, mid-stream.
+    """
+    originals = ingest.originals_index()
     out = []
     for entry in acc.values():
         pages = sorted(entry["pages"])
@@ -136,7 +142,7 @@ def _finalize_sources(acc: dict) -> list[dict]:
             # Retained so anything reading the pre-grouping field keeps working,
             # including conversations replayed from localStorage.
             "page": pages[0] if pages else 1,
-            "has_original": ingest.has_original(entry["doc_id"]),
+            "has_original": entry["doc_id"] in originals,
         }
         if entry["figures"]:
             source["figures"] = entry["figures"]

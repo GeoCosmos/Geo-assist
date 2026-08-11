@@ -1103,14 +1103,23 @@ async def move_document(doc_id: str, new_folder: str) -> int:
     return moved
 
 
-def has_original(doc_id: str) -> bool:
-    """Whether this document's source file is on disk.
+def originals_index() -> set[str]:
+    """doc_ids whose source file is on disk, from a single directory read.
 
     Used to decide whether a citation should be rendered as a link. Without it
-    the UI offers every citation as a link and the only way to find a dead one is
-    to click it and get raw JSON in a new tab.
+    the UI offers every citation as a link, and the only way to find a dead one
+    is to click it and get raw JSON in a new tab.
+
+    Deliberately a bulk read rather than a per-document glob. The catalog path
+    asks about every document in the corpus at once, and
+    `glob(ORIGINALS_DIR/{doc_id}.*)` rescans the whole directory per call — with
+    a few thousand NAS-ingested files that is O(docs x files) of synchronous
+    stat work on the event loop, mid-stream, stalling every concurrent chat.
     """
-    return bool(glob.glob(os.path.join(config.ORIGINALS_DIR, f"{doc_id}.*")))
+    try:
+        return {name.split(".", 1)[0] for name in os.listdir(config.ORIGINALS_DIR)}
+    except OSError:
+        return set()  # directory absent: no source files at all
 
 
 def figure_index(chunk_index: int) -> int:

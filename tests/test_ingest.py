@@ -900,23 +900,24 @@ async def test_on_flush_receives_written_results(mock_ollama):
 
 # ── originals presence ────────────────────────────────────────────────────────
 
-def test_has_original_true_when_file_present(tmp_path, monkeypatch):
+def test_originals_index_lists_stored_doc_ids(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path / "originals"))
     os.makedirs(config.ORIGINALS_DIR)
     open(os.path.join(config.ORIGINALS_DIR, "abc123def4567890.pdf"), "wb").write(b"x")
-    assert ingest.has_original("abc123def4567890") is True
+    open(os.path.join(config.ORIGINALS_DIR, "0011223344556677.docx"), "wb").write(b"x")
+    assert ingest.originals_index() == {"abc123def4567890", "0011223344556677"}
 
 
-def test_has_original_false_when_file_absent(tmp_path, monkeypatch):
+def test_originals_index_empty_when_no_files(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path / "originals"))
     os.makedirs(config.ORIGINALS_DIR)
-    assert ingest.has_original("abc123def4567890") is False
+    assert ingest.originals_index() == set()
 
 
-def test_has_original_false_when_directory_missing(tmp_path, monkeypatch):
+def test_originals_index_empty_when_directory_missing(tmp_path, monkeypatch):
     """The deployment case: data/ was never persisted, so nothing exists."""
     monkeypatch.setattr(config, "ORIGINALS_DIR", str(tmp_path / "gone"))
-    assert ingest.has_original("abc123def4567890") is False
+    assert ingest.originals_index() == set()
 
 
 def test_figure_index_inverts_the_chunk_index_encoding():
