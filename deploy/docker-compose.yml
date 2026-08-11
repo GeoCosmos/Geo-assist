@@ -39,6 +39,10 @@ services:
       - GEO_QDRANT_HOST=qdrant
       - GEO_QDRANT_PORT=6333
       - GEO_NAS_ROOT=/app/documents
+      # Must be on before the first bulk scan: there is no backfill pass,
+      # so figures ingested with OCR off stay uncaptioned until their
+      # document is re-ingested.
+      - GEO_OCR=true
     ports:
       - "8743:8743"
     volumes:
