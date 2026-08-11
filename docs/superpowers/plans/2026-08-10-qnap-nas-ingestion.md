@@ -1811,7 +1811,7 @@ Expected: `- ./data:/app/data` is present.
 
 - [ ] **Step 3: Apply the remaining compose changes on the VM**
 
-Edit `/opt/geo-assist/docker-compose.yml` to match `deploy/docker-compose.yml`, substituting the confirmed share path for `$NAS_MOUNT_A`.
+Edit `/opt/geo-assist/docker-compose.yml` to match `deploy/docker-compose.yml`, substituting the host's actual CIFS mount path for the placeholder.
 
 - [ ] **Step 4: Rebuild and verify**
 

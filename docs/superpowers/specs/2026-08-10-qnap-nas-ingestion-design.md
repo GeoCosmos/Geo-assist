@@ -198,7 +198,7 @@ in Error Handling relies on):
 
 | | Mount 1 | Mount 2 |
 |---|---|---|
-| Share | `primary document share` | `secondary share` |
+| Share | primary document share | secondary share |
 | Host path | `$NAS_MOUNT_A` | `$NAS_MOUNT_B` |
 | Ownership | `uid=0,gid=0` (not forced) | `uid=1000,gid=1000` forced |
 | SMB | 3.0 | 3.1.1 |
@@ -215,7 +215,7 @@ Compose changes required:
   own bind. Add `- ./data:/app/data` to the app service. Without it, the NAS
   manifest is wiped on every deploy and each scan re-reads the entire share.
 - **Bind the document share read-only** at `/app/documents`, with
-  `GEO_NAS_ROOT=/app/documents`. An unused `a single-project bind under /app/documents/`
+  `GEO_NAS_ROOT=/app/documents`. An unused single-project bind under `/app/documents/`
   bind already exists — a half-finished attempt at this feature, since no code reads
   that path. It is replaced by a read-only bind of the share root. `:ro` is what
   makes constraint 1 structural; the underlying CIFS mounts are `rw`.
@@ -266,11 +266,12 @@ route beats a watcher over SMB.
 
 ## Open questions
 
-1. **Which share holds the document repository.** `$NAS_MOUNT_B`
-   (mount 2) is 50 MB and contains exactly one file of a supported type, so it is
-   not the corpus despite being the compose-adjacent mount. Mount 1 (`$NAS_MOUNT_A`)
-   is the likely repository and is not currently bound into any container. Blocks
-   implementation: the wrong answer means ingesting the wrong company share.
+1. **Which share holds the document repository.** The compose-adjacent mount
+   (`$NAS_MOUNT_B`) holds 50 MB and exactly one file of a supported type, so it is
+   not the corpus. `$NAS_MOUNT_A` is the likely repository and is not currently
+   bound into any container. Blocks deployment: the wrong answer means ingesting
+   the wrong company share. Actual host paths are deliberately not recorded here —
+   this repository is public.
 Resolved:
 
 - **Originals storage — keep the copy.** The VM has 74 GB free of 193 GB and the
